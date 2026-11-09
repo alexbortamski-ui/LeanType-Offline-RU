@@ -1,0 +1,3414 @@
+/*
+ * Copyright (C) 2013 The Android Open Source Project
+ * modified
+ * SPDX-License-Identifier: Apache-2.0 AND GPL-3.0-only
+ */
+
+package helium314.keyboard.latin.inputlogic
+
+import android.graphics.Color
+import android.os.SystemClock
+import android.text.InputType
+import android.text.SpannableString
+import android.text.TextUtils
+import android.text.style.BackgroundColorSpan
+import android.text.style.SuggestionSpan
+import android.view.KeyCharacterMap
+import android.view.KeyEvent
+import android.view.inputmethod.CorrectionInfo
+import android.view.inputmethod.EditorInfo
+import helium314.keyboard.compat.AppQuirksManager
+import helium314.keyboard.event.Event
+import helium314.keyboard.event.InputTransaction
+import helium314.keyboard.latin.cjk.CjkInputManager
+import helium314.keyboard.keyboard.Keyboard
+import helium314.keyboard.keyboard.KeyboardActionListenerImpl
+import helium314.keyboard.keyboard.KeyboardId
+import helium314.keyboard.keyboard.KeyboardLayoutSet
+import helium314.keyboard.keyboard.KeyboardSwitcher
+import helium314.keyboard.keyboard.internal.keyboard_parser.floris.KeyCode
+import helium314.keyboard.latin.DictionaryFacilitator
+import helium314.keyboard.latin.LastComposedWord
+import helium314.keyboard.latin.LatinIME
+import helium314.keyboard.latin.R
+import helium314.keyboard.latin.NgramContext
+import helium314.keyboard.latin.RichInputConnection
+import helium314.keyboard.latin.SingleDictionaryFacilitator
+import helium314.keyboard.latin.Suggest
+import helium314.keyboard.latin.SuggestedWords
+import helium314.keyboard.latin.SuggestedWords.SuggestedWordInfo
+import helium314.keyboard.latin.WordComposer
+import helium314.keyboard.latin.common.Constants
+import helium314.keyboard.latin.common.InputPointers
+import helium314.keyboard.latin.common.StringUtils
+import helium314.keyboard.latin.common.getTextWithAutoCorrectionIndicatorUnderline
+import helium314.keyboard.latin.common.getTextWithSuggestionSpan
+import helium314.keyboard.latin.common.isEmoji
+import helium314.keyboard.latin.common.splitOnWhitespace
+import helium314.keyboard.latin.define.DebugFlags
+import helium314.keyboard.latin.dictionary.Dictionary
+import helium314.keyboard.latin.dictionary.DictionaryFactory
+import helium314.keyboard.latin.settings.Settings
+import helium314.keyboard.latin.settings.SettingsValues
+import helium314.keyboard.latin.settings.SpacingAndPunctuations
+import helium314.keyboard.latin.suggestions.SuggestionStripViewAccessor
+import helium314.keyboard.latin.utils.AsyncResultHolder
+import helium314.keyboard.latin.utils.DictionaryInfoUtils
+import helium314.keyboard.latin.utils.InputTypeUtils
+import helium314.keyboard.latin.utils.IntentUtils
+import helium314.keyboard.latin.utils.Log
+import helium314.keyboard.latin.utils.ProofreadHelper
+import helium314.keyboard.latin.utils.RecapitalizeMode
+import helium314.keyboard.latin.utils.RecapitalizeStatus
+import helium314.keyboard.latin.utils.ScriptUtils
+import helium314.keyboard.latin.utils.StatsUtils
+import helium314.keyboard.latin.utils.CustomAIKeyText
+import helium314.keyboard.latin.utils.TextExpanderUtils
+import helium314.keyboard.latin.utils.TextPlacement
+import helium314.keyboard.latin.utils.TextRange
+import helium314.keyboard.latin.utils.getTimestamp
+import java.text.BreakIterator
+import java.util.ArrayList
+import java.util.Locale
+import java.util.concurrent.TimeUnit
+
+class InputLogic(
+    private val mLatinIME: LatinIME,
+    private val mSuggestionStripViewAccessor: SuggestionStripViewAccessor,
+    private val mDictionaryFacilitator: DictionaryFacilitator
+) {
+    private var mSpaceState = SpaceState.NONE
+    private var mSuggestedWords: SuggestedWords = SuggestedWords.getEmptyInstance()
+    private val mSuggest: Suggest = Suggest(mDictionaryFacilitator)
+    private var mEmojiDictionaryFacilitator: SingleDictionaryFacilitator? = null
+
+    private var mLastComposedWord: LastComposedWord = LastComposedWord.NOT_A_COMPOSED_WORD
+    private val mWordComposer = WordComposer()
+    private val mConnection = RichInputConnection(mLatinIME)
+    private val mRecapitalizeStatus = RecapitalizeStatus()
+    // the composing word at the time the shift key was pressed down, null if there was none
+    // used to tell a tap on shift from typing a letter while holding shift
+    private var mTypedWordOnShiftPress: String? = null
+    /** caps lock was enabled by [recapitalizeComposingWord], it is released when the word is finished */
+    private var mCapsLockFromRecapitalize = false
+
+    private var mDeleteCount = 0
+    // for "backspace repeat deletes words": repeat ticks in the current hold, and words deleted so far
+    private var mBackspaceRepeatTicks = 0
+    private var mBackspaceWordsDeleted = 0
+    /** time (ms after the first key repeat) when the next word is deleted */
+    private var mBackspaceNextWordTime = 0f
+    /** word deletion not possible in the current hold (no text available), normal deletion is used */
+    private var mBackspaceWordModeFailed = false
+    private var mLastKeyTime = 0L
+    private var mEnteredText: String? = null
+    private var mIsAutoCorrectionIndicatorOn = false
+    private var mDoubleSpacePeriodCountdownStart = 0L
+    private var mWordBeingCorrectedByCursor: String? = null
+    private var mResumedWordStart = -1
+    private var mResumedWordEnd = -1
+    private var mLastExpandedText: String? = null
+    private var mLastShortcutText: String? = null
+    private var mLastExpandedCursorPosition = -1
+    private var mLastExpandedCursorOffset = -1
+    private var mJustRevertedExpandedShortcut: String? = null
+    private var mJustRevertedACommit = false
+    private var mIsProcessingSelectionUpdate = false
+    private var mIsRecoveringComposingSpan = false
+    private var mLastSpanReclaimTime = 0L
+
+    private var mAutoCommitSequenceNumber = 1
+    private var mTextBeforeProofread: String? = null
+    private var mTextBeforeTranslate: String? = null
+
+    private val mInputLogicHandler = InputLogicHandler(mLatinIME.mHandler, this)
+
+    val connection: RichInputConnection
+        get() = mConnection
+
+    val suggest: Suggest
+        get() = mSuggest
+
+    val wordComposer: WordComposer
+        get() = mWordComposer
+
+    val suggestedWords: SuggestedWords
+        get() = mSuggestedWords
+
+    fun startInput(combiningSpec: String?, settingsValues: SettingsValues) {
+        mCapsLockFromRecapitalize = false
+        mEnteredText = null
+        mWordBeingCorrectedByCursor = null
+        mConnection.onStartInput()
+        if (mWordComposer.getTypedWord().isNotEmpty()) {
+            StatsUtils.onWordCommitUserTyped(mWordComposer.getTypedWord(), mWordComposer.isBatchMode())
+        }
+        mWordComposer.restartCombining(combiningSpec)
+        resetComposingState(true)
+        mDeleteCount = 0
+        mSpaceState = SpaceState.NONE
+        mRecapitalizeStatus.disable()
+
+        mSuggestedWords = SuggestedWords.getEmptyInstance()
+        mConnection.tryFixIncorrectCursorPosition()
+        cancelDoubleSpacePeriodCountdown()
+        mInputLogicHandler.reset()
+        mConnection.requestCursorUpdates(true, true)
+        setInlineEmojiSearchAction(false)
+    }
+
+    fun onSubtypeChanged(combiningSpec: String?, settingsValues: SettingsValues) {
+        finishInput()
+        startInput(combiningSpec, settingsValues)
+    }
+
+    fun onOrientationChange(settingsValues: SettingsValues) {
+        if (mWordComposer.isComposingWord()) {
+            mConnection.beginBatchEdit()
+            try {
+                commitTyped(settingsValues, LastComposedWord.NOT_A_SEPARATOR)
+            } finally {
+                mConnection.endBatchEdit()
+            }
+        }
+    }
+
+    fun finishInput() {
+        if (mWordComposer.isComposingWord()) {
+            mConnection.finishComposingText()
+            StatsUtils.onWordCommitUserTyped(mWordComposer.getTypedWord(), mWordComposer.isBatchMode())
+        }
+        resetComposingState(true)
+        mInputLogicHandler.reset()
+        mSpaceState = SpaceState.NONE
+        mConnection.ensureBatchEditClosed()
+    }
+
+    fun onUpdateSelection(
+        oldSelStart: Int, oldSelEnd: Int,
+        newSelStart: Int, newSelEnd: Int,
+        composingSpanStart: Int, composingSpanEnd: Int,
+        settingsValues: SettingsValues
+    ): Boolean {
+        if (mIsProcessingSelectionUpdate) return false
+        mIsProcessingSelectionUpdate = true
+        mConnection.isSelectionUpdateInProgress = true
+        try {
+            if (mConnection.isBelatedExpectedUpdate(oldSelStart, newSelStart, oldSelEnd, newSelEnd, composingSpanStart, composingSpanEnd)) {
+                return false
+            }
+
+            val isWeb = InputTypeUtils.isWebEditor(getCurrentInputEditorInfo())
+            if (isWeb && mWordComposer.isComposingWord() && composingSpanStart == -1 && composingSpanEnd == -1) {
+                // The web editor / contenteditable JS destroyed our composing span in the DOM.
+                // Reclaim the region if possible; otherwise reset composing state to prevent duplicate characters.
+                val now = SystemClock.uptimeMillis()
+                val wordLength = mWordComposer.size()
+                val reclaimed = if (!mIsRecoveringComposingSpan && now - mLastSpanReclaimTime >= 120L && wordLength > 0 && newSelStart >= wordLength) {
+                    mIsRecoveringComposingSpan = true
+                    mLastSpanReclaimTime = now
+                    try {
+                        mConnection.setComposingRegion(newSelStart - wordLength, newSelStart)
+                    } finally {
+                        mIsRecoveringComposingSpan = false
+                    }
+                } else false
+                if (!reclaimed) {
+                    resetEntireInputState(newSelStart, newSelEnd, false)
+                }
+            }
+            mSpaceState = SpaceState.NONE
+
+            if (oldSelStart != newSelStart || oldSelEnd != newSelEnd) {
+                if (newSelStart != mLastExpandedCursorPosition) {
+                    mLastExpandedText = null
+                    mLastShortcutText = null
+                    mLastExpandedCursorPosition = -1
+                    mLastExpandedCursorOffset = -1
+                    mJustRevertedExpandedShortcut = null
+                }
+            }
+
+            val selectionChangedOrSafeToReset = (oldSelStart != newSelStart || oldSelEnd != newSelEnd) || !mWordComposer.isComposingWord()
+            val hasOrHadSelection = (oldSelStart != oldSelEnd || newSelStart != newSelEnd)
+            val moveAmount = newSelStart - oldSelStart
+
+            if (hasOrHadSelection || !settingsValues.needsToLookupSuggestions() ||
+                (selectionChangedOrSafeToReset && !mWordComposer.moveCursorByAndReturnIfInsideComposingWord(moveAmount))) {
+                resetEntireInputState(newSelStart, newSelEnd, false)
+            } else {
+                mConnection.resetCachesUponCursorMoveAndReturnSuccess(newSelStart, newSelEnd, false)
+            }
+
+            mRecapitalizeStatus.enable()
+            if (!mLatinIME.isCursorGestureActive) {
+                if (kotlin.math.abs(newSelStart - oldSelStart) > Constants.EDITOR_CONTENTS_CACHE_SIZE || mConnection.hasRecentLargeCommit()) {
+                    mSuggestionStripViewAccessor.setNeutralSuggestionStrip()
+                } else {
+                    mLatinIME.mHandler.postResumeSuggestions(true)
+                }
+            }
+            mRecapitalizeStatus.stop()
+            mWordBeingCorrectedByCursor = null
+            return true
+        } finally {
+            mIsProcessingSelectionUpdate = false
+            mConnection.isSelectionUpdateInProgress = false
+        }
+    }
+
+    fun moveCursorByAndReturnIfInsideComposingWord(distance: Int): Boolean {
+        return mWordComposer.moveCursorByAndReturnIfInsideComposingWord(distance)
+    }
+
+    fun onTextInput(
+        settingsValues: SettingsValues,
+        event: Event,
+        keyboardShiftMode: Int,
+        handler: LatinIME.UIHandler
+    ): InputTransaction {
+        val rawText = event.textToCommit.toString()
+        val text = performSpecificTldProcessingOnTextInput(rawText)
+        val inputTransaction = InputTransaction(
+            settingsValues, event,
+            SystemClock.uptimeMillis(), mSpaceState,
+            getActualCapsMode(settingsValues, keyboardShiftMode)
+        )
+        mConnection.beginBatchEdit()
+        try {
+            if (mWordComposer.isComposingWord()) {
+                if (mWordComposer.isCursorFrontOrMiddleOfComposingWord()) {
+                    // stop composing, otherwise the text will end up at the end of the current word
+                    mConnection.finishComposingText()
+                    resetComposingState(false)
+                } else {
+                    commitCurrentAutoCorrection(settingsValues, rawText, handler)
+                    addToHistoryIfEmoji(rawText, settingsValues) // add emoji after committing text
+                }
+            } else {
+                addToHistoryIfEmoji(rawText, settingsValues) // add emoji before resetting, otherwise lastComposedWord is empty
+                resetComposingState(true /* alsoResetLastComposedWord */)
+            }
+            handler.postUpdateSuggestionStrip(SuggestedWords.INPUT_STYLE_TYPING)
+            if (SpaceState.PHANTOM == mSpaceState) {
+                insertAutomaticSpaceIfOptionsAndTextAllow(settingsValues)
+            }
+            mConnection.commitText(text, 1)
+            StatsUtils.onWordCommitUserTyped(mEnteredText, mWordComposer.isBatchMode())
+        } finally {
+            mConnection.endBatchEdit()
+        }
+        // Space state must be updated before calling updateShiftState
+        // ponytail: set PHANTOM space state after emoji if autospace after emoji is enabled
+        mSpaceState = if (settingsValues.mAutospaceAfterEmoji && isEmoji(text)) SpaceState.PHANTOM else SpaceState.NONE
+        mEnteredText = text
+        mWordBeingCorrectedByCursor = null
+        inputTransaction.setDidAffectContents()
+        inputTransaction.requireShiftUpdate(InputTransaction.SHIFT_UPDATE_NOW)
+        return inputTransaction
+    }
+
+    fun onPickSuggestionManually(
+        settingsValues: SettingsValues,
+        suggestionInfo: SuggestedWordInfo,
+        keyboardShiftState: Int,
+        handler: LatinIME.UIHandler
+    ): InputTransaction {
+        if (isInlineEmojiSearchAction()) {
+            deleteTextReplacedByEmoji()
+        }
+
+        val suggestedWords = mSuggestedWords
+        val suggestion = suggestionInfo.mWord
+        // If this is a punctuation picked from the suggestion strip, pass it to onCodeInput
+        if (suggestion.length == 1 && suggestedWords.isPunctuationSuggestions) {
+            // We still want to log a suggestion click.
+            StatsUtils.onPickSuggestionManually(mSuggestedWords, suggestionInfo, mDictionaryFacilitator)
+            // Word separators are suggested before the user inputs something.
+            // Rely on onCodeInput to do the complicated swapping/stripping logic consistently.
+            val event = Event.createPunctuationSuggestionPickedEvent(suggestionInfo)
+            return onCodeInput(settingsValues, event, keyboardShiftState, handler)
+        }
+
+        val event = Event.createSuggestionPickedEvent(suggestionInfo)
+        val inputTransaction = InputTransaction(
+            settingsValues,
+            event, SystemClock.uptimeMillis(), mSpaceState, keyboardShiftState
+        )
+        if (DebugFlags.DEBUG_ENABLED) {
+            Log.i("SuggestTrace", "pickSuggestion: composingBefore=" + mWordComposer.isComposingWord())
+        }
+        // Manual pick affects the contents of the editor, so we take note of this. It's important for the sequence of language switching.
+        inputTransaction.setDidAffectContents()
+        mConnection.beginBatchEdit()
+        try {
+            if (SpaceState.PHANTOM == mSpaceState && suggestion.isNotEmpty()
+                // In the batch input mode, a manually picked suggested word should just replace the current batch input text and there is no need for a phantom space.
+                && !mWordComposer.isBatchMode()
+                // when a commit was reverted and user chose a different suggestion, we don't want to insert a space before the picked word
+                && !mJustRevertedACommit
+            ) {
+                val firstChar = Character.codePointAt(suggestion, 0)
+                if (!settingsValues.isWordSeparator(firstChar) || settingsValues.isUsuallyPrecededBySpace(firstChar)) {
+                    insertAutomaticSpaceIfOptionsAndTextAllow(settingsValues)
+                }
+            }
+            mJustRevertedACommit = false
+
+            if (suggestionInfo.isKindOf(SuggestedWordInfo.KIND_APP_DEFINED)) {
+                mSuggestedWords = SuggestedWords.getEmptyInstance()
+                mSuggestionStripViewAccessor.setNeutralSuggestionStrip()
+                inputTransaction.requireShiftUpdate(InputTransaction.SHIFT_UPDATE_NOW)
+                resetComposingState(true /* alsoResetLastComposedWord */)
+                mConnection.commitCompletion(suggestionInfo.mApplicationSpecifiedCompletionInfo)
+                return inputTransaction
+            }
+
+            val isImmediate = settingsValues.mAutospaceAfterSuggestion && settingsValues.mImmediateAutoSpace && settingsValues.shouldInsertSpacesAutomatically() && !mConnection.hasTextAfterCursor()
+            val cursorMovedBack = commitChosenWord(
+                settingsValues, suggestion, LastComposedWord.COMMIT_TYPE_MANUAL_PICK,
+                if (isImmediate) Constants.STRING_SPACE else LastComposedWord.NOT_A_SEPARATOR
+            )
+            mConnection.finishComposingText()
+            if (cursorMovedBack) {
+                resetComposingState(false)
+                mSpaceState = SpaceState.NONE
+            } else if (settingsValues.mAutospaceAfterSuggestion) {
+                if (isImmediate) {
+                    mConnection.commitText(" ", 1)
+                    mConnection.finishComposingText()
+                    resetComposingState(false)
+                    mSpaceState = SpaceState.DOUBLE
+                } else {
+                    resetComposingState(false)
+                    mSpaceState = SpaceState.PHANTOM
+                }
+            } else {
+                resetComposingState(false)
+                mSpaceState = SpaceState.NONE
+            }
+        } finally {
+            mConnection.endBatchEdit()
+        }
+        inputTransaction.requireShiftUpdate(InputTransaction.SHIFT_UPDATE_NOW)
+        setInlineEmojiSearchAction(false)
+
+        handler.postUpdateSuggestionStrip(SuggestedWords.INPUT_STYLE_NONE)
+
+        StatsUtils.onPickSuggestionManually(mSuggestedWords, suggestionInfo, mDictionaryFacilitator)
+        StatsUtils.onWordCommitSuggestionPickedManually(suggestionInfo.mWord, mWordComposer.isBatchMode())
+        return inputTransaction
+    }
+
+    fun onCodeInput(
+        settingsValues: SettingsValues,
+        event: Event,
+        keyboardShiftMode: Int,
+        handler: LatinIME.UIHandler
+    ): InputTransaction {
+        mWordBeingCorrectedByCursor = null
+        mResumedWordStart = -1
+        mResumedWordEnd = -1
+        mJustRevertedACommit = false
+        val processedEvent = mWordComposer.processEvent(event)
+        val inputTransaction = InputTransaction(
+            settingsValues,
+            processedEvent, SystemClock.uptimeMillis(), mSpaceState,
+            getActualCapsMode(settingsValues, keyboardShiftMode)
+        )
+        if (processedEvent.keyCode != KeyCode.DELETE
+            || inputTransaction.timestamp > mLastKeyTime + Constants.LONG_PRESS_MILLISECONDS
+        ) {
+            mDeleteCount = 0
+        }
+        if (processedEvent.keyCode != KeyCode.DELETE) {
+            mLastExpandedText = null
+            mLastShortcutText = null
+            mLastExpandedCursorPosition = -1
+            mLastExpandedCursorOffset = -1
+            mJustRevertedExpandedShortcut = null
+        }
+        mLastKeyTime = inputTransaction.timestamp
+        mConnection.beginBatchEdit()
+        try {
+            if (!mWordComposer.isComposingWord()) {
+                mIsAutoCorrectionIndicatorOn = false
+            }
+
+            if (processedEvent.codePoint != Constants.CODE_SPACE && event.codePoint != Constants.CODE_SPACE) {
+                cancelDoubleSpacePeriodCountdown()
+            }
+
+            var currentEvent: Event? = processedEvent
+            while (null != currentEvent) {
+                if (currentEvent.isConsumed) {
+                    handleConsumedEvent(currentEvent, inputTransaction)
+                } else if (currentEvent.isFunctionalKeyEvent) {
+                    handleFunctionalEvent(currentEvent, inputTransaction, handler)
+                } else {
+                    handleNonFunctionalEvent(currentEvent, inputTransaction, handler)
+                }
+                currentEvent = currentEvent.nextEvent
+            }
+
+            if (!mConnection.hasSlowInputConnection() && !mWordComposer.isComposingWord()
+                && (settingsValues.isWordCodePoint(processedEvent.codePoint)
+                    || processedEvent.keyCode == KeyCode.DELETE)
+            ) {
+                mWordBeingCorrectedByCursor = getWordAtCursor(settingsValues)
+            }
+            if (!inputTransaction.didAutoCorrect() && processedEvent.keyCode != KeyCode.SHIFT
+                && processedEvent.keyCode != KeyCode.CAPS_LOCK
+                && processedEvent.keyCode != KeyCode.SYMBOL_ALPHA
+                && processedEvent.keyCode != KeyCode.ALPHA
+                && processedEvent.keyCode != KeyCode.SYMBOL
+                && processedEvent.keyCode != KeyCode.CUSTOM1
+                && processedEvent.keyCode != KeyCode.CUSTOM2
+                && processedEvent.keyCode != KeyCode.CUSTOM3
+                && processedEvent.keyCode != KeyCode.CUSTOM4
+                && processedEvent.keyCode != KeyCode.CUSTOM5
+            ) {
+                mLastComposedWord.deactivate()
+            }
+            if (KeyCode.DELETE != processedEvent.keyCode) {
+                mEnteredText = null
+            }
+            // caps lock only for the word that was changed to upper case with shift, the next word is normal again
+            if (mCapsLockFromRecapitalize && !mWordComposer.isComposingWord()) {
+                mCapsLockFromRecapitalize = false
+                KeyboardSwitcher.getInstance().setCapsLock(false)
+                inputTransaction.requireShiftUpdate(InputTransaction.SHIFT_UPDATE_NOW)
+            }
+        } finally {
+            mConnection.endBatchEdit()
+        }
+        return inputTransaction
+    }
+
+    fun onStartBatchInput(
+        settingsValues: SettingsValues,
+        keyboardSwitcher: KeyboardSwitcher,
+        handler: LatinIME.UIHandler
+    ) {
+        mWordBeingCorrectedByCursor = null
+        mInputLogicHandler.onStartBatchInput()
+        handler.showGesturePreviewAndSetSuggestions(SuggestedWords.getEmptyBatchInstance(), false)
+        handler.cancelUpdateSuggestionStrip()
+        ++mAutoCommitSequenceNumber
+        val isInternalField = keyboardSwitcher.isGifPickerShowing ||
+                keyboardSwitcher.isShowingClipboardHistory ||
+                keyboardSwitcher.isShowingEmojiPalettes
+        if (isInternalField) {
+            mWordComposer.reset()
+            return
+        }
+        mConnection.beginBatchEdit()
+        try {
+            if (mWordComposer.isComposingWord()) {
+                if (mWordComposer.isCursorFrontOrMiddleOfComposingWord()) {
+                    unlearnWord(mWordComposer.getTypedWord(), settingsValues, Constants.EVENT_BACKSPACE)
+                    resetEntireInputState(mConnection.expectedSelectionStart, mConnection.expectedSelectionEnd, true)
+                } else if (mWordComposer.isSingleLetter() && !isInlineEmojiSearchAction()) {
+                    commitCurrentAutoCorrection(settingsValues, LastComposedWord.NOT_A_SEPARATOR, handler)
+                } else {
+                    commitTyped(settingsValues, LastComposedWord.NOT_A_SEPARATOR)
+                }
+            } else if (mConnection.hasSelection()) {
+                val selectedText = mConnection.getSelectedText(0)
+                if (selectedText != null) {
+                    mWordComposer.setRejectedBatchModeSuggestion(selectedText.toString())
+                }
+            }
+            val codePointBeforeCursor = mConnection.codePointBeforeCursor
+            if (Character.isLetterOrDigit(codePointBeforeCursor)
+                || settingsValues.isUsuallyFollowedBySpace(codePointBeforeCursor)
+            ) {
+                val autoShiftHasBeenOverriden = keyboardSwitcher.keyboardShiftMode != getCurrentAutoCapsState(settingsValues)
+                if (settingsValues.mAutospaceBeforeGestureTyping) {
+                    mSpaceState = SpaceState.PHANTOM
+                }
+                if (!autoShiftHasBeenOverriden) {
+                    keyboardSwitcher.requestUpdatingShiftState(
+                        getCurrentAutoCapsState(settingsValues),
+                        getCurrentRecapitalizeState()
+                    )
+                }
+            }
+        } finally {
+            mConnection.endBatchEdit()
+        }
+        mWordComposer.setCapitalizedModeAtStartComposingTime(
+            getActualCapsMode(settingsValues, keyboardSwitcher.keyboardShiftMode)
+        )
+    }
+
+    fun onUpdateBatchInput(batchPointers: InputPointers) {
+        mInputLogicHandler.onUpdateBatchInput(batchPointers, mAutoCommitSequenceNumber)
+    }
+
+    fun onEndBatchInput(batchPointers: InputPointers) {
+        mInputLogicHandler.updateTailBatchInput(batchPointers, mAutoCommitSequenceNumber)
+        ++mAutoCommitSequenceNumber
+    }
+
+    fun onCancelBatchInput(handler: LatinIME.UIHandler) {
+        mInputLogicHandler.onCancelBatchInput()
+        handler.showGesturePreviewAndSetSuggestions(
+            SuggestedWords.getEmptyInstance(), true /* dismissGestureFloatingPreviewText */
+        )
+    }
+
+    fun setSuggestedWords(suggestedWords: SuggestedWords) {
+        if (!suggestedWords.isEmpty) {
+            val suggestedWordInfo = if (suggestedWords.mWillAutoCorrect) {
+                suggestedWords.getInfo(SuggestedWords.INDEX_OF_AUTO_CORRECTION)
+            } else {
+                suggestedWords.mTypedWordInfo
+            }
+            mWordComposer.setAutoCorrection(suggestedWordInfo)
+        }
+        mSuggestedWords = suggestedWords
+        val newAutoCorrectionIndicator = suggestedWords.mWillAutoCorrect
+
+        if (mIsAutoCorrectionIndicatorOn != newAutoCorrectionIndicator && mWordComposer.isComposingWord()) {
+            mIsAutoCorrectionIndicatorOn = newAutoCorrectionIndicator
+            val textWithUnderline = getTextWithUnderline(mWordComposer.getTypedWord())
+            setComposingTextInternal(textWithUnderline, 1)
+        }
+    }
+
+    private fun handleConsumedEvent(event: Event, inputTransaction: InputTransaction) {
+        val textToCommit = event.textToCommit
+        if (!TextUtils.isEmpty(textToCommit)) {
+            mConnection.commitText(textToCommit, 1)
+            inputTransaction.setDidAffectContents()
+        }
+        if (mWordComposer.isComposingWord()) {
+            if (SpaceState.PHANTOM == inputTransaction.spaceState
+                && "bn_khipro" == mWordComposer.getCombiningSpec()
+            ) {
+                insertAutomaticSpaceIfOptionsAndTextAllow(inputTransaction.settingsValues)
+                mSpaceState = SpaceState.NONE
+            }
+            setComposingTextInternal(mWordComposer.getTypedWord(), 1)
+            inputTransaction.setDidAffectContents()
+            inputTransaction.setRequiresUpdateSuggestions()
+        }
+    }
+
+    private fun handleClipboardPaste() {
+        val clipboardContent = mLatinIME.clipboardHistoryManager.retrieveClipboardContent().toString()
+        if (clipboardContent.isEmpty()) {
+            return
+        }
+        mLatinIME.onTextInput(clipboardContent)
+    }
+
+    private fun handleProofread() {
+        Log.i(TAG, "handleProofread() called")
+        if (ProofreadHelper.isOperationInProgress) {
+            Log.i(TAG, "Cancelling current proofreading operation")
+            ProofreadHelper.cancelCurrentOperation()
+            return
+        }
+        val textToProofread: String
+        val hasSelection = mConnection.hasSelection()
+
+        if (hasSelection) {
+            val selectedText = mConnection.getSelectedText(0)
+            textToProofread = selectedText?.toString() ?: ""
+            Log.i(TAG, "Proofreading selected text: ${textToProofread.length} chars")
+        } else {
+            val maxChars = 60000
+            var textBefore: CharSequence? = null
+            var textAfter: CharSequence? = null
+            try {
+                textBefore = mConnection.getTextBeforeCursor(maxChars, 0)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to get text before cursor: $e")
+            }
+            try {
+                textAfter = mConnection.getTextAfterCursor(maxChars, 0)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to get text after cursor: $e")
+                try {
+                    textAfter = mConnection.getTextAfterCursor(2048, 0)
+                } catch (e2: Exception) {
+                    Log.e(TAG, "Failed to get text after cursor (retry): $e2")
+                }
+            }
+            val before = textBefore?.toString() ?: ""
+            val after = textAfter?.toString() ?: ""
+            textToProofread = before + after
+            mConnection.selectAll()
+        }
+
+        mTextBeforeProofread = textToProofread
+        val targetEditorInfo = getCurrentInputEditorInfo()
+        val targetPackage = targetEditorInfo?.packageName
+        val targetFieldId = targetEditorInfo?.fieldId
+
+        ProofreadHelper.proofreadAsync(
+            mLatinIME,
+            textToProofread,
+            hasSelection,
+            onSuccess = { proofreadText ->
+                if (!mLatinIME.isInputViewShown || !mConnection.isConnected()) {
+                    Log.w(TAG, "Input view hidden or disconnected during proofread, ignoring result")
+                    return@proofreadAsync
+                }
+                val currentEditor = getCurrentInputEditorInfo()
+                if (currentEditor?.packageName != targetPackage || currentEditor?.fieldId != targetFieldId) {
+                    Log.w(TAG, "Target editor changed during proofread, ignoring result")
+                    return@proofreadAsync
+                }
+                val textBefore = mTextBeforeProofread
+                if (proofreadText.isNotEmpty() && proofreadText != textBefore) {
+                    if (textBefore != null && textBefore.length > 20 && proofreadText.length < textBefore.length * 0.3) {
+                        Log.w(TAG, "Proofread result suspiciously short (${proofreadText.length} vs ${textBefore.length}), aborting replacement to prevent truncation data loss")
+                        KeyboardSwitcher.getInstance().showToast(mLatinIME.getString(R.string.proofread_output_truncated), false)
+                        if (!hasSelection) {
+                            val len = textBefore.length
+                            mConnection.setSelection(len, len)
+                        }
+                        return@proofreadAsync
+                    }
+                    if (hasSelection) {
+                        mConnection.commitText(proofreadText, 1)
+                    } else {
+                        mConnection.replaceEntireText(proofreadText)
+                    }
+                } else {
+                    if (!hasSelection) {
+                        val len = textBefore?.length ?: 0
+                        mConnection.setSelection(len, len)
+                    }
+                }
+            },
+            onError = { errorMessage ->
+                Log.e(TAG, "Proofreading error: $errorMessage")
+            }
+        )
+    }
+
+    private fun handleTranslate() {
+        val textToTranslate: String
+        val hasSelection = mConnection.hasSelection()
+
+        if (hasSelection) {
+            val selectedText = mConnection.getSelectedText(0)
+            textToTranslate = selectedText?.toString() ?: ""
+        } else {
+            val maxChars = 60000
+            var textBefore: CharSequence? = null
+            var textAfter: CharSequence? = null
+            try {
+                textBefore = mConnection.getTextBeforeCursor(maxChars, 0)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to get text before cursor: $e")
+            }
+            try {
+                textAfter = mConnection.getTextAfterCursor(maxChars, 0)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to get text after cursor: $e")
+                try {
+                    textAfter = mConnection.getTextAfterCursor(2048, 0)
+                } catch (e2: Exception) {
+                    Log.e(TAG, "Failed to get text after cursor (retry): $e2")
+                }
+            }
+            val before = textBefore?.toString() ?: ""
+            val after = textAfter?.toString() ?: ""
+            textToTranslate = before + after
+            if (textToTranslate.isNotBlank()) {
+                mConnection.selectAll()
+            }
+        }
+
+        if (textToTranslate.isBlank()) {
+            KeyboardSwitcher.getInstance().showToast(mLatinIME.getString(R.string.translate_no_text), false)
+            return
+        }
+
+        mTextBeforeTranslate = textToTranslate
+        val targetEditorInfo = getCurrentInputEditorInfo()
+        val targetPackage = targetEditorInfo?.packageName
+        val targetFieldId = targetEditorInfo?.fieldId
+
+        ProofreadHelper.translateAsync(
+            mLatinIME,
+            textToTranslate,
+            hasSelection,
+            onSuccess = { translatedText ->
+                if (!mLatinIME.isInputViewShown || !mConnection.isConnected()) {
+                    Log.w(TAG, "Input view hidden or disconnected during translation, ignoring result")
+                    return@translateAsync
+                }
+                val currentEditor = getCurrentInputEditorInfo()
+                if (currentEditor?.packageName != targetPackage || currentEditor?.fieldId != targetFieldId) {
+                    Log.w(TAG, "Target editor changed during translation, ignoring result")
+                    return@translateAsync
+                }
+                val textBefore = mTextBeforeTranslate
+                if (translatedText.isNotEmpty() && translatedText != textBefore) {
+                    if (textBefore != null && textBefore.length > 20 && translatedText.length < textBefore.length * 0.3) {
+                        Log.w(TAG, "Translation result suspiciously short (${translatedText.length} vs ${textBefore.length}), aborting replacement to prevent truncation data loss")
+                        KeyboardSwitcher.getInstance().showToast(mLatinIME.getString(R.string.translation_output_truncated), false)
+                        if (!hasSelection) {
+                            val len = textBefore.length
+                            mConnection.setSelection(len, len)
+                        }
+                        return@translateAsync
+                    }
+                    if (hasSelection) {
+                        mConnection.commitText(translatedText, 1)
+                    } else {
+                        mConnection.replaceEntireText(translatedText)
+                    }
+                } else {
+                    if (!hasSelection) {
+                        val len = textBefore?.length ?: 0
+                        mConnection.setSelection(len, len)
+                    }
+                    if (translatedText == textBefore) {
+                        KeyboardSwitcher.getInstance().showToast(mLatinIME.getString(R.string.translation_unchanged), false)
+                    }
+                }
+            },
+            onError = { errorMessage ->
+                Log.e(TAG, "Translation error: $errorMessage")
+            }
+        )
+    }
+
+    private fun handleShowTranslateLanguages() {
+        mLatinIME.showTranslateLanguageSelector()
+    }
+
+    private fun handleFunctionalEvent(
+        event: Event,
+        inputTransaction: InputTransaction,
+        handler: LatinIME.UIHandler
+    ) {
+        val currentKeyboardScript = inputTransaction.settingsValues.mCurrentKeyboardScript
+        val keyCode = event.keyCode
+        when (keyCode) {
+            KeyCode.DELETE -> {
+                handleBackspaceEvent(event, inputTransaction)
+                inputTransaction.setDidAffectContents()
+            }
+            KeyCode.SHIFT -> {
+                val keyboard = KeyboardSwitcher.getInstance().keyboard
+                if (keyboard != null && !keyboard.mId.isAlphabetKeyboard && keyboard.mId.mElementId != KeyboardId.ELEMENT_TEXT_EDIT) {
+                    return
+                }
+                if (KeyboardSwitcher.getInstance().isGifPickerShowing) {
+                    return
+                }
+                if (!KeyboardSwitcher.getInstance().isShiftChording) {
+                    if (!recapitalizeComposingWord(inputTransaction.settingsValues)) {
+                        performRecapitalization(inputTransaction.settingsValues)
+                    }
+                }
+                inputTransaction.requireShiftUpdate(InputTransaction.SHIFT_UPDATE_NOW)
+                inputTransaction.setRequiresUpdateSuggestions()
+                if (mSpaceState == SpaceState.PHANTOM && inputTransaction.settingsValues.mShiftRemovesAutospace) {
+                    mSpaceState = SpaceState.NONE
+                }
+            }
+            KeyCode.SETTINGS -> onSettingsKeyPressed()
+            KeyCode.ACTION_NEXT -> performEditorAction(EditorInfo.IME_ACTION_NEXT, inputTransaction.settingsValues, handler)
+            KeyCode.ACTION_PREVIOUS -> performEditorAction(EditorInfo.IME_ACTION_PREVIOUS, inputTransaction.settingsValues, handler)
+            KeyCode.LANGUAGE_SWITCH -> handleLanguageSwitchKey()
+            KeyCode.CLIPBOARD -> {
+                if (!inputTransaction.settingsValues.mClipboardHistoryEnabled) {
+                    handleClipboardPaste()
+                }
+            }
+            KeyCode.CLIPBOARD_PASTE -> {
+                handleClipboardPaste()
+                KeyboardActionListenerImpl.deactivateSelectionMode()
+            }
+            KeyCode.SHIFT_ENTER -> {
+                val tmpEvent = Event.createSoftwareKeypressEvent(
+                    Constants.CODE_ENTER, keyCode, 0, event.x, event.y, event.isKeyRepeat
+                )
+                handleNonSpecialCharacterEvent(tmpEvent, inputTransaction, handler)
+                inputTransaction.setDidAffectContents()
+            }
+            KeyCode.MULTIPLE_CODE_POINTS -> mWordComposer.applyProcessedEvent(event, true)
+            KeyCode.CLIPBOARD_SELECT_ALL -> mConnection.selectAll()
+            KeyCode.CLIPBOARD_SELECT_WORD -> mConnection.selectWord(
+                inputTransaction.settingsValues.mSpacingAndPunctuations, currentKeyboardScript
+            )
+            KeyCode.CLIPBOARD_COPY -> {
+                val hadSelection = mConnection.hasSelection()
+                val selEnd = maxOf(mConnection.expectedSelectionStart, mConnection.expectedSelectionEnd)
+                mConnection.copyText(true)
+                if (hadSelection && selEnd >= 0) {
+                    mConnection.setSelection(selEnd, selEnd)
+                }
+                KeyboardActionListenerImpl.deactivateSelectionMode()
+                mLatinIME.mHandler.post { mLatinIME.tryShowClipboardSuggestion() }
+            }
+            KeyCode.CLIPBOARD_COPY_ALL -> {
+                mConnection.copyText(false)
+                KeyboardActionListenerImpl.deactivateSelectionMode()
+                mLatinIME.mHandler.post { mLatinIME.tryShowClipboardSuggestion() }
+            }
+            KeyCode.CLIPBOARD_CLEAR_HISTORY -> mLatinIME.clipboardHistoryManager.clearHistory()
+            KeyCode.CLIPBOARD_CUT -> {
+                if (mConnection.hasSelection()) {
+                    mConnection.copyText(true)
+                    val backspaceEvent = Event.createSoftwareKeypressEvent(
+                        KeyCode.DELETE, 0, event.x, event.y, event.isKeyRepeat
+                    )
+                    handleBackspaceEvent(backspaceEvent, inputTransaction)
+                    inputTransaction.setDidAffectContents()
+                }
+                KeyboardActionListenerImpl.deactivateSelectionMode()
+            }
+            KeyCode.WORD_LEFT -> {
+                if (mWordComposer.isComposingWord()) {
+                    mConnection.finishComposingText()
+                    StatsUtils.onWordCommitUserTyped(mWordComposer.getTypedWord(), mWordComposer.isBatchMode())
+                    resetComposingState(true)
+                }
+                sendDownUpKeyEventWithMetaState(
+                    if (ScriptUtils.isScriptRtl(currentKeyboardScript)) KeyEvent.KEYCODE_DPAD_RIGHT else KeyEvent.KEYCODE_DPAD_LEFT,
+                    KeyEvent.META_CTRL_ON or event.metaState
+                )
+            }
+            KeyCode.WORD_RIGHT -> {
+                if (mWordComposer.isComposingWord()) {
+                    mConnection.finishComposingText()
+                    StatsUtils.onWordCommitUserTyped(mWordComposer.getTypedWord(), mWordComposer.isBatchMode())
+                    resetComposingState(true)
+                }
+                sendDownUpKeyEventWithMetaState(
+                    if (ScriptUtils.isScriptRtl(currentKeyboardScript)) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT,
+                    KeyEvent.META_CTRL_ON or event.metaState
+                )
+            }
+            KeyCode.MOVE_START_OF_PAGE -> {
+                if (mWordComposer.isComposingWord()) {
+                    mConnection.finishComposingText()
+                    StatsUtils.onWordCommitUserTyped(mWordComposer.getTypedWord(), mWordComposer.isBatchMode())
+                    resetComposingState(true)
+                }
+                val isSelecting = (event.metaState and KeyEvent.META_SHIFT_MASK) != 0
+                if (isSelecting) {
+                    val anchor = mConnection.expectedSelectionEnd
+                    mConnection.setSelection(0, anchor)
+                } else {
+                    sendDownUpKeyEventWithMetaState(
+                        KeyEvent.KEYCODE_MOVE_HOME,
+                        KeyEvent.META_CTRL_ON or event.metaState
+                    )
+                    mConnection.setSelection(0, 0)
+                }
+            }
+            KeyCode.MOVE_END_OF_PAGE -> {
+                if (mWordComposer.isComposingWord()) {
+                    mConnection.finishComposingText()
+                    StatsUtils.onWordCommitUserTyped(mWordComposer.getTypedWord(), mWordComposer.isBatchMode())
+                    resetComposingState(true)
+                }
+                val isSelecting = (event.metaState and KeyEvent.META_SHIFT_MASK) != 0
+                val after = mConnection.getTextAfterCursor(1000000, 0)
+                val textEnd = mConnection.expectedSelectionEnd + (after?.length ?: 0)
+                if (isSelecting) {
+                    val anchor = mConnection.expectedSelectionStart
+                    mConnection.setSelection(anchor, textEnd)
+                } else {
+                    sendDownUpKeyEventWithMetaState(
+                        KeyEvent.KEYCODE_MOVE_END,
+                        KeyEvent.META_CTRL_ON or event.metaState
+                    )
+                    mConnection.setSelection(textEnd, textEnd)
+                }
+            }
+            KeyCode.UNDO -> sendDownUpKeyEventWithMetaState(KeyEvent.KEYCODE_Z, KeyEvent.META_CTRL_ON)
+            KeyCode.REDO -> sendDownUpKeyEventWithMetaState(KeyEvent.KEYCODE_Z, KeyEvent.META_CTRL_ON or KeyEvent.META_SHIFT_ON)
+            KeyCode.CUSTOM_AI_1 -> handleCustomAIKey(1)
+            KeyCode.CUSTOM_AI_2 -> handleCustomAIKey(2)
+            KeyCode.CUSTOM_AI_3 -> handleCustomAIKey(3)
+            KeyCode.CUSTOM_AI_4 -> handleCustomAIKey(4)
+            KeyCode.CUSTOM_AI_5 -> handleCustomAIKey(5)
+            KeyCode.CUSTOM_AI_6 -> handleCustomAIKey(6)
+            KeyCode.CUSTOM_AI_7 -> handleCustomAIKey(7)
+            KeyCode.CUSTOM_AI_8 -> handleCustomAIKey(8)
+            KeyCode.CUSTOM_AI_9 -> handleCustomAIKey(9)
+            KeyCode.CUSTOM_AI_10 -> handleCustomAIKey(10)
+            KeyCode.PROOFREAD -> handleProofread()
+            KeyCode.TRANSLATE -> handleTranslate()
+            KeyCode.SHOW_TRANSLATE_LANGUAGES -> handleShowTranslateLanguages()
+            KeyCode.SPLIT_LAYOUT -> KeyboardSwitcher.getInstance().toggleSplitKeyboardMode()
+            KeyCode.TIMESTAMP -> mLatinIME.onTextInput(getTimestamp(mLatinIME))
+            KeyCode.SEND_INTENT_ONE, KeyCode.SEND_INTENT_TWO, KeyCode.SEND_INTENT_THREE -> {
+                IntentUtils.handleSendIntentKey(mLatinIME, event.keyCode)
+            }
+            KeyCode.IME_HIDE_UI -> mLatinIME.requestHideSelf(0)
+            KeyCode.INLINE_EMOJI_SEARCH_DONE -> {
+                setInlineEmojiSearchAction(false)
+                inputTransaction.setRequiresUpdateSuggestions()
+            }
+            KeyCode.VOICE_INPUT, KeyCode.EMOJI, KeyCode.TOGGLE_ONE_HANDED_MODE, KeyCode.SWITCH_ONE_HANDED_MODE,
+            KeyCode.TOGGLE_FLOATING_KEYBOARD, KeyCode.HANDWRITING, KeyCode.CLEAR_HANDWRITING, KeyCode.CLIPBOARD_SEARCH,
+            KeyCode.TOGGLE_TOUCHPAD_MODE, KeyCode.TOGGLE_TEXT_EDIT_MODE, KeyCode.TOGGLE_SELECTION_MODE, KeyCode.SWITCH_TO_USER_IME,
+            KeyCode.CUSTOM1, KeyCode.CUSTOM2, KeyCode.CUSTOM3, KeyCode.CUSTOM4, KeyCode.CUSTOM5,
+            KeyCode.OCR, KeyCode.TOGGLE_INCOGNITO_MODE, KeyCode.TOGGLE_AUTOCORRECT, KeyCode.NOT_SPECIFIED -> {
+                // Handled elsewhere
+            }
+            KeyCode.CAPS_LOCK -> {
+                val keyboard = KeyboardSwitcher.getInstance().keyboard
+                if (keyboard == null || keyboard.mId.isAlphabetKeyboard) {
+                    inputTransaction.setRequiresUpdateSuggestions()
+                }
+            }
+            else -> {
+                val isModifier = with(KeyCode) { keyCode.isModifier() }
+                if (isModifier) return
+                if (event.codePoint >= 32 && (event.metaState and (KeyEvent.META_CTRL_MASK or KeyEvent.META_META_MASK or KeyEvent.META_ALT_LEFT_ON)) == 0) {
+                    handleNonFunctionalEvent(event, inputTransaction, handler)
+                    return
+                }
+                val keyEventCode = if (keyCode > 0) {
+                    keyCode
+                } else if (event.codePoint >= 0) {
+                    KeyCode.codePointToKeyEventCode(event.codePoint)
+                } else {
+                    KeyCode.keyCodeToKeyEventCode(keyCode)
+                }
+                if (keyEventCode != KeyEvent.KEYCODE_UNKNOWN) {
+                    if (mWordComposer.isComposingWord() && isNavigationOrDpadKey(keyEventCode)) {
+                        mConnection.finishComposingText()
+                        StatsUtils.onWordCommitUserTyped(mWordComposer.getTypedWord(), mWordComposer.isBatchMode())
+                        resetComposingState(true)
+                    }
+                    sendDownUpKeyEventWithMetaState(keyEventCode, event.metaState)
+                    return
+                }
+                if (event.metaState != 0 && event.codePoint >= 32) {
+                    handleNonFunctionalEvent(event, inputTransaction, handler)
+                    return
+                }
+                Log.e(TAG, "unknown event, key code: $keyCode, codepoint ${event.codePoint}, meta: ${event.metaState}")
+                if (DebugFlags.DEBUG_ENABLED) {
+                    throw RuntimeException("Unknown event")
+                }
+            }
+        }
+    }
+
+    private fun isNavigationOrDpadKey(keyCode: Int): Boolean = when (keyCode) {
+        KeyEvent.KEYCODE_DPAD_UP,
+        KeyEvent.KEYCODE_DPAD_DOWN,
+        KeyEvent.KEYCODE_DPAD_LEFT,
+        KeyEvent.KEYCODE_DPAD_RIGHT,
+        KeyEvent.KEYCODE_DPAD_CENTER,
+        KeyEvent.KEYCODE_DPAD_DOWN_LEFT,
+        KeyEvent.KEYCODE_DPAD_DOWN_RIGHT,
+        KeyEvent.KEYCODE_DPAD_UP_LEFT,
+        KeyEvent.KEYCODE_DPAD_UP_RIGHT,
+        KeyEvent.KEYCODE_PAGE_UP,
+        KeyEvent.KEYCODE_PAGE_DOWN,
+        KeyEvent.KEYCODE_MOVE_HOME,
+        KeyEvent.KEYCODE_MOVE_END,
+        KeyEvent.KEYCODE_FORWARD_DEL -> true
+        else -> false
+    }
+
+    private fun handleNonFunctionalEvent(
+        event: Event,
+        inputTransaction: InputTransaction,
+        handler: LatinIME.UIHandler
+    ) {
+        inputTransaction.setDidAffectContents()
+        if (event.codePoint == Constants.CODE_ENTER) {
+            if (tryJumpToNextPlaceholder()) {
+                return
+            }
+            val editorInfo = getCurrentInputEditorInfo()
+            val imeOptionsActionId = InputTypeUtils.getImeOptionsActionIdFromEditorInfo(editorInfo)
+            if (InputTypeUtils.IME_ACTION_CUSTOM_LABEL == imeOptionsActionId) {
+                performEditorAction(editorInfo.actionId, inputTransaction.settingsValues, handler)
+            } else if (EditorInfo.IME_ACTION_NONE != imeOptionsActionId) {
+                performEditorAction(imeOptionsActionId, inputTransaction.settingsValues, handler)
+            } else {
+                handleNonSpecialCharacterEvent(event, inputTransaction, handler)
+            }
+        } else {
+            handleNonSpecialCharacterEvent(event, inputTransaction, handler)
+        }
+    }
+
+    private fun handleNonSpecialCharacterEvent(
+        event: Event,
+        inputTransaction: InputTransaction,
+        handler: LatinIME.UIHandler
+    ) {
+        val codePoint = event.codePoint
+        mSpaceState = SpaceState.NONE
+        val sv = inputTransaction.settingsValues
+        if (Character.getType(codePoint) == Character.OTHER_SYMBOL.toInt()
+            || (Character.getType(codePoint) == Character.UNASSIGNED.toInt() && StringUtils.mightBeEmoji(codePoint))
+            || (sv.isWordSeparator(codePoint)
+                && (Character.isWhitespace(codePoint)
+                    || !textBeforeCursorMayBeUrlOrSimilar(sv, false)
+                    || (codePoint == '/'.code && mWordComposer.lastChar() == '/')))
+        ) {
+            handleSeparatorEvent(event, inputTransaction, handler)
+            addToHistoryIfEmoji(StringUtils.newSingleCodePointString(codePoint), sv)
+        } else {
+            if (SpaceState.PHANTOM == inputTransaction.spaceState) {
+                if (mWordComposer.isCursorFrontOrMiddleOfComposingWord()) {
+                    unlearnWord(mWordComposer.getTypedWord(), sv, Constants.EVENT_BACKSPACE)
+                    resetEntireInputState(mConnection.expectedSelectionStart, mConnection.expectedSelectionEnd, true)
+                } else {
+                    commitTyped(sv, LastComposedWord.NOT_A_SEPARATOR)
+                }
+            }
+            handleNonSeparatorEvent(event, sv, inputTransaction)
+        }
+    }
+
+    private fun addToHistoryIfEmoji(text: String, settingsValues: SettingsValues) {
+        if (mLastComposedWord == LastComposedWord.NOT_A_COMPOSED_WORD
+            || mWordComposer.isComposingWord()
+            || !settingsValues.mBigramPredictionEnabled
+            || settingsValues.mIncognitoModeEnabled
+            || !settingsValues.isSuggestionsEnabledPerUserSettings()
+            || !isEmoji(text)
+        ) {
+            return
+        }
+        if (mConnection.hasSlowInputConnection()) {
+            Log.w(TAG, "Skipping learning due to slow InputConnection.")
+            return
+        }
+        mLastComposedWord = LastComposedWord.NOT_A_COMPOSED_WORD
+        mDictionaryFacilitator.addToUserHistory(
+            text,
+            false,
+            mConnection.getNgramContextFromNthPreviousWord(settingsValues.mSpacingAndPunctuations, 2),
+            TimeUnit.MILLISECONDS.toSeconds(System.currentTimeMillis()),
+            settingsValues.mBlockPotentiallyOffensive
+        )
+    }
+
+    private fun handleNonSeparatorEvent(
+        event: Event,
+        settingsValues: SettingsValues,
+        inputTransaction: InputTransaction
+    ) {
+        val codePoint = event.codePoint
+        var isComposingWord = mWordComposer.isComposingWord()
+        mWordComposer.unsetBatchMode()
+
+        if (settingsValues.mUrlDetectionEnabled && settingsValues.needsToLookupSuggestions()
+            && !isComposingWord && SpaceState.NONE == inputTransaction.spaceState
+            && settingsValues.mSpacingAndPunctuations.isSometimesWordConnector(mConnection.codePointBeforeCursor)
+            && !settingsValues.mSpacingAndPunctuations.isSometimesWordConnector(mConnection.charBeforeBeforeCursor)
+            && mConnection.hasLetterBeforeLastSpaceBeforeCursor()
+        ) {
+            val text = mConnection.textBeforeCursorUntilLastWhitespaceOrDoubleSlash()
+            val range = TextRange(text, 0, text.length, text.length, false)
+            isComposingWord = true
+            restartSuggestions(range, settingsValues)
+        }
+
+        if (settingsValues.isSymbolComposingApp && codePoint == '_'.code && !isComposingWord
+            && mConnection.isCursorTouchingWord(settingsValues.mSpacingAndPunctuations, true)
+        ) {
+            restartSuggestionsOnWordTouchedByCursor(settingsValues)
+            isComposingWord = mWordComposer.isComposingWord()
+        }
+
+        if (SpaceState.PHANTOM == inputTransaction.spaceState
+            && !settingsValues.isWordConnector(codePoint)
+            && !settingsValues.isUsuallyFollowedBySpace(codePoint)
+        ) {
+            if (isComposingWord) {
+                throw RuntimeException("Should not be composing here")
+            }
+            insertAutomaticSpaceIfOptionsAndTextAllow(settingsValues)
+        }
+
+        if (mWordComposer.isCursorInFrontOfComposingWord()) {
+            resetEntireInputState(mConnection.expectedSelectionStart, mConnection.expectedSelectionEnd, false)
+            isComposingWord = false
+        } else if (mWordComposer.isCursorFrontOrMiddleOfComposingWord()) {
+            unlearnWord(mWordComposer.getTypedWord(), inputTransaction.settingsValues, Constants.EVENT_BACKSPACE)
+            resetEntireInputState(mConnection.expectedSelectionStart, mConnection.expectedSelectionEnd, true)
+            isComposingWord = false
+        }
+
+        if (!isComposingWord
+            && settingsValues.isWordCodePoint(codePoint)
+            && settingsValues.needsToLookupSuggestions()
+            && !settingsValues.isDirectCommitApp
+            && (!settingsValues.mSpacingAndPunctuations.mCurrentLanguageHasSpaces
+                || !mConnection.isCursorTouchingWord(settingsValues.mSpacingAndPunctuations, !mConnection.hasSlowInputConnection())
+                || isCursorAtStartOrAfterSeparator(settingsValues))
+        ) {
+            isComposingWord = !settingsValues.mSpacingAndPunctuations.isWordConnector(codePoint)
+            resetComposingState(false /* alsoResetLastComposedWord */)
+        }
+
+        enterInlineEmojiSearchIfNeeded(codePoint, settingsValues)
+
+        if (isComposingWord) {
+            mWordComposer.applyProcessedEvent(event)
+            if (mWordComposer.isSingleLetter()) {
+                mWordComposer.setCapitalizedModeAtStartComposingTime(inputTransaction.shiftState)
+            }
+            var didSetComposingText = false
+            var didExpand = false
+            var shouldDeferSegmentation = false
+            if (TextExpanderUtils.isEnabled(mLatinIME)
+                && TextExpanderUtils.isImmediateEnabled(mLatinIME)
+            ) {
+                val typedWord = mWordComposer.getTypedWord()
+                setComposingTextInternal(getTextWithUnderline(typedWord), 1)
+                didSetComposingText = true
+                val textBefore = mConnection.getTextBeforeCursor(50, 0)
+                if (textBefore != null) {
+                    val textStr = textBefore.toString()
+                    val result = TextExpanderUtils.getExpandedWordForTyped(typedWord, textStr, mLatinIME)
+                    if (result != null) {
+                        if (mJustRevertedExpandedShortcut != null && result.matchedString.equals(mJustRevertedExpandedShortcut, ignoreCase = true)) {
+                            // Skip re-expanding
+                        } else {
+                            if (result.prefixLength > 0) {
+                                mConnection.commitText("", 1)
+                                mConnection.deleteTextBeforeCursor(result.prefixLength)
+                            }
+                            val cursorMovedBack = commitExpandedText(result.matchedString, result.expandedText)
+                            resetComposingState(true)
+                            if (cursorMovedBack) {
+                                mSpaceState = SpaceState.NONE
+                            }
+                            didExpand = true
+                        }
+                    }
+                    shouldDeferSegmentation = !didExpand
+                        && ScriptUtils.needsWordSegmentation(settingsValues.mLocale)
+                        && TextExpanderUtils.isPrefixOfNonRegexShortcut(typedWord, textStr, mLatinIME)
+                }
+            }
+            if (!didExpand && !shouldDeferSegmentation) {
+                val didCommitCompletedWordSegments = maybeCommitCompletedWordSegments(settingsValues)
+                if (!didSetComposingText || didCommitCompletedWordSegments) {
+                    setComposingTextInternal(getTextWithUnderline(mWordComposer.getTypedWord()), 1)
+                }
+            }
+        } else {
+            val swapWeakSpace = tryStripSpaceAndReturnWhetherShouldSwapInstead(event, inputTransaction)
+
+            if (swapWeakSpace && trySwapSwapperAndSpace(event, inputTransaction)) {
+                mSpaceState = SpaceState.WEAK
+            } else if ((settingsValues.mInputAttributes.mInputType and InputType.TYPE_MASK_CLASS) != InputType.TYPE_CLASS_TEXT
+                && codePoint >= '0'.code && codePoint <= '9'.code
+            ) {
+                sendDownUpKeyEvent(codePoint - '0'.code + KeyEvent.KEYCODE_0)
+            } else {
+                mConnection.commitCodePoint(codePoint)
+                if (settingsValues.needsToLookupSuggestions() && settingsValues.isWordCodePoint(codePoint)) {
+                    inputTransaction.setRequiresUpdateSuggestions()
+                }
+            }
+            if (TextExpanderUtils.isEnabled(mLatinIME)
+                && TextExpanderUtils.isImmediateEnabled(mLatinIME)
+            ) {
+                val textBefore = mConnection.getTextBeforeCursor(50, 0)
+                if (textBefore != null) {
+                    val result = TextExpanderUtils.getExpandedWordForTyped(null, textBefore.toString(), mLatinIME)
+                    if (result != null) {
+                        if (mJustRevertedExpandedShortcut != null && result.matchedString.equals(mJustRevertedExpandedShortcut, ignoreCase = true)) {
+                            // Skip re-expanding
+                        } else {
+                            mConnection.deleteTextBeforeCursor(result.matchedString.length)
+                            val cursorMovedBack = commitExpandedText(result.matchedString, result.expandedText)
+                            if (cursorMovedBack) {
+                                mSpaceState = SpaceState.NONE
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        inputTransaction.setRequiresUpdateSuggestions()
+    }
+
+    private fun isCursorAtStartOrAfterSeparator(settingsValues: SettingsValues): Boolean {
+        val codePointBeforeCursor = mConnection.codePointBeforeCursor
+        return codePointBeforeCursor == Constants.NOT_A_CODE
+            || settingsValues.mSpacingAndPunctuations.isWordSeparator(codePointBeforeCursor)
+    }
+
+    private fun maybeCommitCompletedWordSegments(settingsValues: SettingsValues): Boolean {
+        if (!ScriptUtils.needsWordSegmentation(settingsValues.mLocale)
+            || settingsValues.mSpacingAndPunctuations.mCurrentLanguageHasSpaces
+        ) {
+            return false
+        }
+
+        val typedWord = mWordComposer.getTypedWord()
+        val length = typedWord.length
+        if (length <= 1) {
+            return false
+        }
+
+        val iterator = THAI_WORD_BREAK_ITERATOR.get() ?: return false
+        iterator.setText(typedWord)
+        var segmentStart = iterator.first()
+        var wordBoundary = iterator.next()
+        var didCommitSegment = false
+        while (wordBoundary != BreakIterator.DONE && wordBoundary < length) {
+            val completedWordSegment = typedWord.substring(segmentStart, wordBoundary)
+            if (!TextUtils.isEmpty(completedWordSegment)) {
+                commitCompletedWordSegment(settingsValues, completedWordSegment)
+                didCommitSegment = true
+            }
+            segmentStart = wordBoundary
+            wordBoundary = iterator.next()
+        }
+        if (!didCommitSegment) {
+            return false
+        }
+
+        val remainingWord = typedWord.substring(segmentStart)
+        val codePoints = StringUtils.toCodePointArray(remainingWord)
+        mWordComposer.setComposingWord(codePoints, mLatinIME.getCoordinatesForCurrentKeyboard(codePoints))
+        return true
+    }
+
+    private fun commitCompletedWordSegment(
+        settingsValues: SettingsValues,
+        completedWordSegment: String
+    ) {
+        val ngramContext = getNgramContextFromNthPreviousWordForSuggestion(settingsValues.mSpacingAndPunctuations, 2)
+        mConnection.commitText(completedWordSegment, 1)
+        performAdditionToUserHistoryDictionary(settingsValues, completedWordSegment, ngramContext)
+        mLastComposedWord = LastComposedWord(
+            ArrayList(), null, completedWordSegment, completedWordSegment,
+            LastComposedWord.NOT_A_SEPARATOR, ngramContext, WordComposer.CAPS_MODE_OFF
+        )
+        StatsUtils.onWordCommitUserTyped(completedWordSegment, mWordComposer.isBatchMode())
+    }
+
+    private fun handleSeparatorEvent(
+        event: Event,
+        inputTransaction: InputTransaction,
+        handler: LatinIME.UIHandler
+    ) {
+        val codePoint = event.codePoint
+        val settingsValues = inputTransaction.settingsValues
+        val wasComposingWord = mWordComposer.isComposingWord()
+        val needsSegmentation = ScriptUtils.needsWordSegmentation(settingsValues.mLocale)
+        val shouldAvoidSendingCode = Constants.CODE_SPACE == codePoint
+            && !settingsValues.mSpacingAndPunctuations.mCurrentLanguageHasSpaces
+            && wasComposingWord
+            && !needsSegmentation
+
+        if (!wasComposingWord && mConnection.hasSelection()) {
+            val pairedCodepoint = settingsValues.mSpacingAndPunctuations.getSecondInSymbolPair(codePoint)
+            if (pairedCodepoint != Constants.NOT_A_CODE && !settingsValues.isDirectCommitApp) {
+                wrapSelection(codePoint, pairedCodepoint)
+                inputTransaction.requireShiftUpdate(InputTransaction.SHIFT_UPDATE_NOW)
+                return
+            }
+        }
+        if (mWordComposer.isCursorFrontOrMiddleOfComposingWord()) {
+            unlearnWord(mWordComposer.getTypedWord(), inputTransaction.settingsValues, Constants.EVENT_BACKSPACE)
+            resetEntireInputState(mConnection.expectedSelectionStart, mConnection.expectedSelectionEnd, true)
+        }
+        if (mWordComposer.isComposingWord()) {
+            var shouldTriggerAutoCorrect = settingsValues.mAutoCorrectEnabled
+            if (shouldTriggerAutoCorrect) {
+                if ("space" == settingsValues.mAutoCorrectTrigger) {
+                    shouldTriggerAutoCorrect = Character.isWhitespace(codePoint)
+                } else if ("punctuation" == settingsValues.mAutoCorrectTrigger) {
+                    shouldTriggerAutoCorrect = !Character.isWhitespace(codePoint)
+                }
+            }
+            val cursorMovedBack = if (shouldTriggerAutoCorrect && !isInlineEmojiSearchAction()) {
+                val separator = if (shouldAvoidSendingCode) LastComposedWord.NOT_A_SEPARATOR else StringUtils.newSingleCodePointString(codePoint)
+                val moved = commitCurrentAutoCorrection(settingsValues, separator, handler)
+                inputTransaction.setDidAutoCorrect()
+                moved
+            } else {
+                commitTyped(settingsValues, StringUtils.newSingleCodePointString(codePoint))
+            }
+            if (cursorMovedBack) {
+                mSpaceState = SpaceState.NONE
+                resetComposingState(true)
+                inputTransaction.setRequiresUpdateSuggestions()
+                return
+            }
+        } else if (TextExpanderUtils.isEnabled(mLatinIME)) {
+            val textBefore = mConnection.getTextBeforeCursor(50, 0)
+            if (textBefore != null) {
+                val result = TextExpanderUtils.getExpandedWordForTyped(null, textBefore.toString(), mLatinIME)
+                if (result != null) {
+                    if (mJustRevertedExpandedShortcut == null
+                        || !result.matchedString.equals(mJustRevertedExpandedShortcut, ignoreCase = true)
+                    ) {
+                        mConnection.deleteTextBeforeCursor(result.matchedString.length)
+                        val cursorMovedBack = commitExpandedText(result.matchedString, result.expandedText)
+                        if (cursorMovedBack) {
+                            mSpaceState = SpaceState.NONE
+                            resetComposingState(true)
+                            inputTransaction.setRequiresUpdateSuggestions()
+                            return
+                        }
+                    }
+                }
+            }
+        }
+
+        val swapWeakSpace = tryStripSpaceAndReturnWhetherShouldSwapInstead(event, inputTransaction)
+        val isInsideDoubleQuoteOrAfterDigit = Constants.CODE_DOUBLE_QUOTE == codePoint && mConnection.isInsideDoubleQuoteOrAfterDigit()
+
+        val needsPrecedingSpace = if (SpaceState.PHANTOM != inputTransaction.spaceState) {
+            false
+        } else if (Constants.CODE_DOUBLE_QUOTE == codePoint) {
+            !isInsideDoubleQuoteOrAfterDigit
+        } else if (settingsValues.mSpacingAndPunctuations.isClusteringSymbol(codePoint)
+            && settingsValues.mSpacingAndPunctuations.isClusteringSymbol(mConnection.codePointBeforeCursor)
+        ) {
+            false
+        } else {
+            settingsValues.isUsuallyPrecededBySpace(codePoint) || isEmoji(codePoint)
+        }
+
+        if (needsPrecedingSpace && !settingsValues.isAutoSpaceDisabled) {
+            insertAutomaticSpaceIfOptionsAndTextAllow(settingsValues)
+        }
+
+        if (tryPerformDoubleSpacePeriod(event, inputTransaction)) {
+            mSpaceState = SpaceState.DOUBLE
+            inputTransaction.setRequiresUpdateSuggestions()
+            StatsUtils.onDoubleSpacePeriod()
+        } else if (swapWeakSpace && trySwapSwapperAndSpace(event, inputTransaction)) {
+            mSpaceState = SpaceState.SWAP_PUNCTUATION
+            mSuggestionStripViewAccessor.setNeutralSuggestionStrip()
+        } else if (Constants.CODE_SPACE == codePoint) {
+            if (DebugFlags.DEBUG_ENABLED) {
+                Log.i("SuggestTrace", "space: wasComposing=$wasComposingWord suggestedWordsEmpty=${mSuggestedWords.isEmpty}")
+            }
+            if (!mSuggestedWords.isPunctuationSuggestions) {
+                mSpaceState = SpaceState.WEAK
+            }
+
+            startDoubleSpacePeriodCountdown(inputTransaction)
+            if (wasComposingWord || mSuggestedWords.isEmpty) {
+                inputTransaction.setRequiresUpdateSuggestions()
+            }
+
+            if (!shouldAvoidSendingCode) {
+                mConnection.commitCodePoint(codePoint)
+            }
+        } else {
+            if (SpaceState.PHANTOM == inputTransaction.spaceState
+                && (settingsValues.isUsuallyFollowedBySpace(codePoint) || isInsideDoubleQuoteOrAfterDigit)
+            ) {
+                if (!settingsValues.isAutoSpaceDisabled) {
+                    mSpaceState = SpaceState.PHANTOM
+                }
+            } else {
+                if (wasComposingWord
+                    && settingsValues.mAutospaceAfterPunctuation
+                    && (settingsValues.isUsuallyFollowedBySpace(codePoint) || isInsideDoubleQuoteOrAfterDigit)
+                ) {
+                    if (!settingsValues.isAutoSpaceDisabled) {
+                        mSpaceState = SpaceState.PHANTOM
+                    }
+                }
+            }
+
+            enterInlineEmojiSearchIfNeeded(codePoint, settingsValues)
+            mConnection.commitCodePoint(codePoint)
+
+            if (isInlineEmojiSearchAction()) {
+                inputTransaction.setRequiresUpdateSuggestions()
+            } else {
+                mSuggestionStripViewAccessor.setNeutralSuggestionStrip()
+            }
+        }
+
+        inputTransaction.requireShiftUpdate(InputTransaction.SHIFT_UPDATE_NOW)
+    }
+
+    private fun getBackspaceExtraDeletes(deleteCount: Int): Int {
+        if (deleteCount <= Constants.DELETE_ACCELERATE_AT) return 0
+        val count = deleteCount - Constants.DELETE_ACCELERATE_AT
+        return when {
+            count < 10 -> 1
+            count < 20 -> 2
+            count < 30 -> 3
+            count < 40 -> 4
+            count < 50 -> 6
+            count < 60 -> 9
+            count < 70 -> 13
+            else -> (13 + (count - 70) / 2).coerceAtMost(20)
+        }
+    }
+
+    /**
+     * Whether holding delete currently removes whole words. Not for languages without spaces, where
+     * a "word" may be a whole sentence. Also used to give feedback per word instead of per key repeat.
+     */
+    fun isBackspaceWordModeActive(settingsValues: SettingsValues): Boolean =
+        settingsValues.mBackspaceRepeatDeletesWords
+            && settingsValues.mSpacingAndPunctuations.mCurrentLanguageHasSpaces
+            && !mBackspaceWordModeFailed
+
+    /**
+     * When the option is enabled and the delete key is held down, switch from deleting characters
+     * to deleting whole words after a short while. Words are deleted with increasing speed.
+     * Returns true if the event was consumed (a word was deleted, or this repeat tick is skipped).
+     */
+    private fun handleBackspaceRepeatWordDeletion(event: Event, settingsValues: SettingsValues): Boolean {
+        if (!event.isKeyRepeat || mDeleteCount <= 1) {
+            // new press of the delete key
+            mBackspaceRepeatTicks = 0
+            mBackspaceWordsDeleted = 0
+            mBackspaceNextWordTime = 0f
+            mBackspaceWordModeFailed = false
+        }
+        if (!event.isKeyRepeat) return false
+        mBackspaceRepeatTicks++
+        if (!isBackspaceWordModeActive(settingsValues)) return false
+        // key repeats come in fixed intervals, so we can count time in repeats
+        val time = (mBackspaceRepeatTicks - 1) * KEY_REPEAT_INTERVAL_MS
+        if (time < mBackspaceNextWordTime) return true // wait between words
+
+        if (mWordComposer.isComposingWord()) {
+            mConnection.finishComposingText()
+            resetComposingState(true)
+        }
+        // with very short intervals, more than one word may be due per key repeat
+        var deletedWords = 0
+        while (time >= mBackspaceNextWordTime && deletedWords < 2) {
+            val textBefore = mConnection.getTextBeforeCursor(BACKSPACE_WORD_LOOKBACK, 0)?.toString()
+            if (textBefore == null) { // fall back to normal deletion
+                mBackspaceWordModeFailed = true
+                return deletedWords > 0
+            }
+            if (textBefore.isEmpty()) return true
+            val length = textBefore.length - getStartOfPreviousWord(textBefore)
+            if (InputTypeUtils.isWebEditor(getCurrentInputEditorInfo())) {
+                repeat(length) { sendDownUpKeyEvent(KeyEvent.KEYCODE_DEL) }
+            } else {
+                mConnection.deleteTextBeforeCursor(length)
+            }
+            StatsUtils.onBackspaceWordDelete(length)
+            mBackspaceNextWordTime += getBackspaceWordInterval(mBackspaceWordsDeleted)
+            mBackspaceWordsDeleted++
+            deletedWords++
+        }
+        mSuggestionStripViewAccessor.setNeutralSuggestionStrip()
+        // one feedback per deleted word, key repeat feedback is suppressed in word mode
+        mLatinIME.feedbackForDeletedWord()
+        return true
+    }
+
+    fun deleteWordBeforeCursor() {
+        val settingsValues = Settings.getValues()
+        if (mConnection.hasSelection()) {
+            val selection = mConnection.getSelectedText(0)
+            if (!selection.isNullOrEmpty()) {
+                unlearnWord(selection.toString(), settingsValues, Constants.EVENT_BACKSPACE)
+            }
+            mWordComposer.reset()
+            sendDownUpKeyEvent(KeyEvent.KEYCODE_DEL)
+            mSuggestionStripViewAccessor.setNeutralSuggestionStrip()
+            mLatinIME.feedbackForDeletedWord()
+            KeyboardActionListenerImpl.deactivateSelectionMode()
+            return
+        }
+
+        if (mWordComposer.isComposingWord()) {
+            val composingWord = mWordComposer.getTypedWord()
+            if (!TextUtils.isEmpty(composingWord)) {
+                unlearnWord(composingWord, settingsValues, Constants.EVENT_BACKSPACE)
+            }
+            mWordComposer.reset()
+            mConnection.finishComposingText()
+            mConnection.commitText("", 1)
+            resetComposingState(true)
+            mSuggestionStripViewAccessor.setNeutralSuggestionStrip()
+            mLatinIME.feedbackForDeletedWord()
+            return
+        }
+
+        val textBefore = mConnection.getTextBeforeCursor(BACKSPACE_WORD_LOOKBACK, 0)?.toString()
+        if (textBefore.isNullOrEmpty()) return
+
+        val length = textBefore.length - getStartOfPreviousWord(textBefore)
+        if (length <= 0) return
+
+        if (InputTypeUtils.isWebEditor(getCurrentInputEditorInfo())) {
+            repeat(length) { sendDownUpKeyEvent(KeyEvent.KEYCODE_DEL) }
+        } else {
+            mConnection.deleteTextBeforeCursor(length)
+        }
+        StatsUtils.onBackspaceWordDelete(length)
+        mSuggestionStripViewAccessor.setNeutralSuggestionStrip()
+        mLatinIME.feedbackForDeletedWord()
+    }
+
+    private fun handleBackspaceEvent(event: Event, inputTransaction: InputTransaction) {
+        val currentKeyboardScript = inputTransaction.settingsValues.mCurrentKeyboardScript
+        mSpaceState = SpaceState.NONE
+        mDeleteCount++
+
+        val selection = if (event.isKeyRepeat) null else mConnection.getSelectedText(0)
+        val hasSelection = !selection.isNullOrEmpty() || (!event.isKeyRepeat && mConnection.hasSelection())
+        if (hasSelection) {
+            val numCharsDeleted = if (!selection.isNullOrEmpty()) selection.length else (mConnection.expectedSelectionEnd - mConnection.expectedSelectionStart)
+            if (!selection.isNullOrEmpty()) {
+                unlearnWord(selection.toString(), inputTransaction.settingsValues, Constants.EVENT_BACKSPACE)
+            }
+            mWordComposer.reset()
+            sendDownUpKeyEvent(KeyEvent.KEYCODE_DEL)
+            StatsUtils.onBackspaceSelectedText(numCharsDeleted)
+            if (inputTransaction.settingsValues.needsToLookupSuggestions()
+                && inputTransaction.settingsValues.mSpacingAndPunctuations.mCurrentLanguageHasSpaces
+            ) {
+                restartSuggestionsOnWordTouchedByCursor(inputTransaction.settingsValues)
+            }
+            KeyboardActionListenerImpl.deactivateSelectionMode()
+            inputTransaction.requireShiftUpdate(InputTransaction.SHIFT_UPDATE_LATER)
+            return
+        }
+
+        val lastExpandedText = mLastExpandedText
+        if (lastExpandedText != null && !event.isKeyRepeat
+            && TextExpanderUtils.isBackspaceRevertsEnabled(mLatinIME)
+        ) {
+            val expectedCursor = mConnection.expectedSelectionEnd
+            if (expectedCursor == mLastExpandedCursorPosition) {
+                val beforeLen = mLastExpandedCursorOffset
+                val afterLen = lastExpandedText.length - beforeLen
+                val textBefore = mConnection.getTextBeforeCursor(beforeLen, 0)
+                val textAfter = mConnection.getTextAfterCursor(afterLen, 0)
+                val expectedBefore = lastExpandedText.substring(0, beforeLen)
+                val expectedAfter = lastExpandedText.substring(beforeLen)
+                if (textBefore != null && textBefore.toString() == expectedBefore
+                    && textAfter != null && textAfter.toString() == expectedAfter
+                ) {
+                    mJustRevertedExpandedShortcut = mLastShortcutText
+                    mConnection.deleteSurroundingText(beforeLen, afterLen)
+                    mConnection.commitText(mLastShortcutText ?: "", 1)
+                    mLastExpandedText = null
+                    mLastShortcutText = null
+                    mLastExpandedCursorPosition = -1
+                    mLastExpandedCursorOffset = -1
+                    mLastComposedWord = LastComposedWord.NOT_A_COMPOSED_WORD
+                    return
+                }
+            }
+        }
+
+        val shiftUpdateKind = if (event.isKeyRepeat && mConnection.expectedSelectionStart > 0) {
+            InputTransaction.SHIFT_UPDATE_LATER
+        } else {
+            InputTransaction.SHIFT_UPDATE_NOW
+        }
+        inputTransaction.requireShiftUpdate(shiftUpdateKind)
+
+        if (handleBackspaceRepeatWordDeletion(event, inputTransaction.settingsValues)) return
+
+        if (mWordComposer.isCursorFrontOrMiddleOfComposingWord()) {
+            unlearnWord(mWordComposer.getTypedWord(), inputTransaction.settingsValues, Constants.EVENT_BACKSPACE)
+            resetEntireInputState(mConnection.expectedSelectionStart, mConnection.expectedSelectionEnd, true)
+        }
+        if (mWordComposer.isComposingWord()) {
+            val wasBatchMode = mWordComposer.isBatchMode()
+            val initialLength = mWordComposer.getTypedWord().length
+            var deletedCodePoints = 0
+            if (mWordComposer.isBatchMode()) {
+                val rejectedSuggestion = mWordComposer.getTypedWord()
+                mWordComposer.reset()
+                mWordComposer.setRejectedBatchModeSuggestion(rejectedSuggestion)
+                if (!TextUtils.isEmpty(rejectedSuggestion)) {
+                    unlearnWord(rejectedSuggestion, inputTransaction.settingsValues, Constants.EVENT_REJECTION)
+                }
+                StatsUtils.onBackspaceWordDelete(rejectedSuggestion.length)
+            } else {
+                mWordComposer.applyProcessedEvent(event)
+                deletedCodePoints++
+                val extraDeletes = getBackspaceExtraDeletes(mDeleteCount)
+                if (extraDeletes > 0 && mWordComposer.isComposingWord()) {
+                    repeat(extraDeletes) {
+                        if (!mWordComposer.isComposingWord()) return@repeat
+                        mWordComposer.applyProcessedEvent(event)
+                        deletedCodePoints++
+                    }
+                }
+                StatsUtils.onBackspacePressed(deletedCodePoints)
+            }
+            if (mWordComposer.isComposingWord()) {
+                val typedWord = mWordComposer.getTypedWord()
+                setComposingTextInternal(getTextWithUnderline(typedWord), 1)
+                if (TextExpanderUtils.isEnabled(mLatinIME)
+                    && TextExpanderUtils.isImmediateEnabled(mLatinIME)
+                ) {
+                    val textBefore = mConnection.getTextBeforeCursor(50, 0)
+                    if (textBefore != null) {
+                        val result = TextExpanderUtils.getExpandedWordForTyped(typedWord, textBefore.toString(), mLatinIME)
+                        if (result != null) {
+                            if (mJustRevertedExpandedShortcut == null || !result.matchedString.equals(mJustRevertedExpandedShortcut, ignoreCase = true)) {
+                                if (result.prefixLength > 0) {
+                                    mConnection.commitText("", 1)
+                                    mConnection.deleteTextBeforeCursor(result.prefixLength)
+                                }
+                                val cursorMovedBack = commitExpandedText(result.matchedString, result.expandedText)
+                                resetComposingState(true)
+                                if (cursorMovedBack) {
+                                    mSpaceState = SpaceState.NONE
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                if (wasBatchMode) {
+                    mConnection.commitText("", 1)
+                } else {
+                    mConnection.finishComposingText()
+                    mConnection.deleteTextBeforeCursor(initialLength)
+                    val extraDeletes = getBackspaceExtraDeletes(mDeleteCount)
+                    if (deletedCodePoints < (1 + extraDeletes) && extraDeletes > 0) {
+                        unlearnWordBeingDeleted(inputTransaction.settingsValues)
+                        val remainingExtra = (1 + extraDeletes) - deletedCodePoints
+                        val isWeb = InputTypeUtils.isWebEditor(getCurrentInputEditorInfo())
+                        if (isWeb) {
+                            repeat(remainingExtra) {
+                                sendDownUpKeyEvent(KeyEvent.KEYCODE_DEL)
+                                StatsUtils.onBackspacePressed(1)
+                            }
+                        } else {
+                            mConnection.beginBatchEdit()
+                            try {
+                                repeat(remainingExtra) {
+                                    val codePointBeforeCursor = mConnection.codePointBeforeCursor
+                                    if (codePointBeforeCursor == Constants.NOT_A_CODE) return@repeat
+                                    val isEmoji = codePointBeforeCursor > 0xFE00 || StringUtils.mightBeEmoji(codePointBeforeCursor)
+                                    val lengthToDeleteAgain = if (isEmoji) {
+                                        mConnection.charCountToDeleteBeforeCursor
+                                    } else {
+                                        1
+                                    }
+                                    mConnection.deleteTextBeforeCursor(lengthToDeleteAgain)
+                                    StatsUtils.onBackspacePressed(lengthToDeleteAgain)
+                                }
+                            } finally {
+                                mConnection.endBatchEdit()
+                            }
+                        }
+                    }
+                }
+            }
+            updateInlineEmojiSearch()
+            inputTransaction.setRequiresUpdateSuggestions()
+        } else {
+            if (mJustRevertedExpandedShortcut != null) {
+                mLastComposedWord = LastComposedWord.NOT_A_COMPOSED_WORD
+                mJustRevertedExpandedShortcut = null
+            }
+            if (mLastComposedWord.canRevertCommit()
+                && inputTransaction.settingsValues.mBackspaceRevertsAutocorrect
+                && !TextUtils.isDigitsOnly(mLastComposedWord.mCommittedWord)
+            ) {
+                val lastComposedWord = mLastComposedWord.mTypedWord
+                revertCommit(inputTransaction)
+                StatsUtils.onRevertAutoCorrect()
+                StatsUtils.onWordCommitUserTyped(lastComposedWord, mWordComposer.isBatchMode())
+                if (inputTransaction.settingsValues.needsToLookupSuggestions()
+                    && inputTransaction.settingsValues.mSpacingAndPunctuations.mCurrentLanguageHasSpaces
+                ) {
+                    restartSuggestionsOnWordTouchedByCursor(inputTransaction.settingsValues)
+                }
+                return
+            }
+            if (SpaceState.DOUBLE == inputTransaction.spaceState) {
+                cancelDoubleSpacePeriodCountdown()
+                if (mConnection.revertDoubleSpacePeriod(inputTransaction.settingsValues.mSpacingAndPunctuations)) {
+                    inputTransaction.setRequiresUpdateSuggestions()
+                    mWordComposer.setCapitalizedModeAtStartComposingTime(WordComposer.CAPS_MODE_OFF)
+                    StatsUtils.onRevertDoubleSpacePeriod()
+                    return
+                }
+            } else if (SpaceState.SWAP_PUNCTUATION == inputTransaction.spaceState) {
+                if (mConnection.revertSwapPunctuation()) {
+                    StatsUtils.onRevertSwapPunctuation()
+                    return
+                }
+            }
+
+            var hasUnlearnedWordBeingDeleted = false
+            val isWeb = InputTypeUtils.isWebEditor(getCurrentInputEditorInfo())
+            if (isWeb) {
+                val fallbackSel = if (event.isKeyRepeat) null else mConnection.getSelectedText(0)
+                if (!TextUtils.isEmpty(fallbackSel) || (!event.isKeyRepeat && mConnection.hasSelection())) {
+                    mWordComposer.reset()
+                    sendDownUpKeyEvent(KeyEvent.KEYCODE_DEL)
+                    return
+                }
+                val extraDeletes = getBackspaceExtraDeletes(mDeleteCount)
+                val totalDeletes = 1 + extraDeletes
+                repeat(totalDeletes) {
+                    sendDownUpKeyEvent(KeyEvent.KEYCODE_DEL)
+                }
+                StatsUtils.onBackspacePressed(totalDeletes)
+                mSuggestionStripViewAccessor.setNeutralSuggestionStrip()
+                return
+            }
+
+            val fallbackSel = if (event.isKeyRepeat) null else mConnection.getSelectedText(0)
+            if (!TextUtils.isEmpty(fallbackSel) || (!event.isKeyRepeat && mConnection.hasSelection())) {
+                mWordComposer.reset()
+                sendDownUpKeyEvent(KeyEvent.KEYCODE_DEL)
+            } else {
+                if (inputTransaction.settingsValues.mInputAttributes.isTypeNull
+                    || Constants.NOT_A_CURSOR_POSITION == mConnection.expectedSelectionEnd
+                ) {
+                    sendDownUpKeyEvent(KeyEvent.KEYCODE_DEL)
+                    var totalDeletedLength = 1
+                    val extraDeletes = getBackspaceExtraDeletes(mDeleteCount)
+                    if (extraDeletes > 0) {
+                        if (!event.isKeyRepeat && mDeleteCount <= 1) {
+                            hasUnlearnedWordBeingDeleted = hasUnlearnedWordBeingDeleted or unlearnWordBeingDeleted(inputTransaction.settingsValues)
+                        }
+                        repeat(extraDeletes) {
+                            sendDownUpKeyEvent(KeyEvent.KEYCODE_DEL)
+                            totalDeletedLength++
+                        }
+                    }
+                    StatsUtils.onBackspacePressed(totalDeletedLength)
+                } else {
+                    val codePointBeforeCursor = mConnection.codePointBeforeCursor
+                    if (codePointBeforeCursor == Constants.NOT_A_CODE) {
+                        mConnection.deleteTextBeforeCursor(1)
+                        return
+                    }
+                    val isEmoji = codePointBeforeCursor > 0xFE00 || StringUtils.mightBeEmoji(codePointBeforeCursor)
+                    val lengthToDelete = if (isEmoji) {
+                        mConnection.charCountToDeleteBeforeCursor
+                    } else {
+                        1
+                    }
+                    mConnection.deleteTextBeforeCursor(lengthToDelete)
+                    var totalDeletedLength = lengthToDelete
+                    val extraDeletes = getBackspaceExtraDeletes(mDeleteCount)
+                    if (extraDeletes > 0) {
+                        if (!event.isKeyRepeat && mDeleteCount <= 1) {
+                            hasUnlearnedWordBeingDeleted = hasUnlearnedWordBeingDeleted or unlearnWordBeingDeleted(inputTransaction.settingsValues)
+                        }
+                        mConnection.beginBatchEdit()
+                        try {
+                            repeat(extraDeletes) {
+                                val codePointBeforeCursorToDeleteAgain = mConnection.codePointBeforeCursor
+                                if (codePointBeforeCursorToDeleteAgain == Constants.NOT_A_CODE) return@repeat
+                                val isEmojiAgain = codePointBeforeCursorToDeleteAgain > 0xFE00 || StringUtils.mightBeEmoji(codePointBeforeCursorToDeleteAgain)
+                                val lengthToDeleteAgain = if (isEmojiAgain) {
+                                    mConnection.charCountToDeleteBeforeCursor
+                                } else {
+                                    1
+                                }
+                                mConnection.deleteTextBeforeCursor(lengthToDeleteAgain)
+                                totalDeletedLength += lengthToDeleteAgain
+                            }
+                        } finally {
+                            mConnection.endBatchEdit()
+                        }
+                    }
+                    StatsUtils.onBackspacePressed(totalDeletedLength)
+                }
+            }
+            if (!hasUnlearnedWordBeingDeleted && !event.isKeyRepeat && mDeleteCount <= 1) {
+                unlearnWordBeingDeleted(inputTransaction.settingsValues)
+            }
+            if (mConnection.hasSlowInputConnection() || event.isKeyRepeat || mDeleteCount > Constants.DELETE_ACCELERATE_AT) {
+                mSuggestionStripViewAccessor.setNeutralSuggestionStrip()
+            } else if (inputTransaction.settingsValues.needsToLookupSuggestions()
+                && inputTransaction.settingsValues.mSpacingAndPunctuations.mCurrentLanguageHasSpaces
+            ) {
+                restartSuggestionsOnWordTouchedByCursor(inputTransaction.settingsValues)
+            }
+        }
+    }
+
+    internal fun getWordAtCursor(settingsValues: SettingsValues): String {
+        val currentKeyboardScript = settingsValues.mCurrentKeyboardScript
+        if (!mConnection.hasSelection()
+            && settingsValues.needsToLookupSuggestions()
+            && settingsValues.mSpacingAndPunctuations.mCurrentLanguageHasSpaces
+        ) {
+            val range = mConnection.getWordRangeAtCursor(settingsValues.mSpacingAndPunctuations, currentKeyboardScript)
+            if (range != null) {
+                return range.mWord.toString()
+            }
+        }
+        return ""
+    }
+
+    internal fun unlearnWordBeingDeleted(settingsValues: SettingsValues): Boolean {
+        if (mConnection.hasSlowInputConnection()) {
+            Log.w(TAG, "Skipping unlearning due to slow InputConnection.")
+            return false
+        }
+        if (!mConnection.isCursorFollowedByWordCharacter(settingsValues.mSpacingAndPunctuations)) {
+            val wordBeingDeleted = getWordAtCursor(settingsValues)
+            if (!TextUtils.isEmpty(wordBeingDeleted)) {
+                unlearnWord(wordBeingDeleted, settingsValues, Constants.EVENT_BACKSPACE)
+                return true
+            }
+        }
+        return false
+    }
+
+    internal fun unlearnWord(word: String, settingsValues: SettingsValues, eventType: Int) {
+        val ngramContext = mConnection.getNgramContextFromNthPreviousWord(settingsValues.mSpacingAndPunctuations, 2)
+        val timeStampInSeconds = TimeUnit.MILLISECONDS.toSeconds(System.currentTimeMillis())
+        mDictionaryFacilitator.unlearnFromUserHistory(word, ngramContext, timeStampInSeconds, eventType)
+    }
+
+    private fun handleLanguageSwitchKey() {
+        mLatinIME.switchToNextSubtype()
+    }
+
+    private fun trySwapSwapperAndSpace(
+        event: Event,
+        inputTransaction: InputTransaction
+    ): Boolean {
+        val codePointBeforeCursor = mConnection.codePointBeforeCursor
+        if (Constants.CODE_SPACE != codePointBeforeCursor) {
+            return false
+        }
+        mConnection.deleteTextBeforeCursor(1)
+        val text = "${event.textToCommit} "
+        mConnection.commitText(text, 1)
+        inputTransaction.requireShiftUpdate(InputTransaction.SHIFT_UPDATE_NOW)
+        return true
+    }
+
+    private fun tryStripSpaceAndReturnWhetherShouldSwapInstead(
+        event: Event,
+        inputTransaction: InputTransaction
+    ): Boolean {
+        val codePoint = event.codePoint
+        val isFromSuggestionStrip = event.isSuggestionStripPress
+        if (Constants.CODE_ENTER == codePoint
+            && SpaceState.SWAP_PUNCTUATION == inputTransaction.spaceState
+        ) {
+            mConnection.removeTrailingSpace()
+            return false
+        }
+
+        // ponytail: only strip auto-inserted spaces (WEAK/PHANTOM/SWAP), never manual (NONE)
+        if (!inputTransaction.settingsValues.mPreserveSpaceBeforePunctuation
+            && isSpaceStrippingPunctuation(codePoint)
+            && !inputTransaction.settingsValues.isUsuallyPrecededBySpace(codePoint)
+            && inputTransaction.spaceState != SpaceState.NONE
+        ) {
+            if (mConnection.codePointBeforeCursor == Constants.CODE_SPACE) {
+                mConnection.removeTrailingSpace()
+            }
+        }
+
+        if (!inputTransaction.settingsValues.mPreserveSpaceBeforePunctuation
+            && (SpaceState.WEAK == inputTransaction.spaceState
+                || SpaceState.SWAP_PUNCTUATION == inputTransaction.spaceState)
+            && isFromSuggestionStrip
+        ) {
+            if (inputTransaction.settingsValues.isUsuallyPrecededBySpace(codePoint)) {
+                return false
+            }
+            if (inputTransaction.settingsValues.isUsuallyFollowedBySpace(codePoint)) {
+                return true
+            }
+            mConnection.removeTrailingSpace()
+        }
+        return false
+    }
+
+    fun startDoubleSpacePeriodCountdown(inputTransaction: InputTransaction) {
+        mDoubleSpacePeriodCountdownStart = inputTransaction.timestamp
+    }
+
+    fun cancelDoubleSpacePeriodCountdown() {
+        mDoubleSpacePeriodCountdownStart = 0
+    }
+
+    fun isDoubleSpacePeriodCountdownActive(inputTransaction: InputTransaction): Boolean {
+        return inputTransaction.timestamp - mDoubleSpacePeriodCountdownStart < inputTransaction.settingsValues.mDoubleSpacePeriodTimeout
+    }
+
+    private fun tryPerformDoubleSpacePeriod(
+        event: Event,
+        inputTransaction: InputTransaction
+    ): Boolean {
+        if (!inputTransaction.settingsValues.mUseDoubleSpacePeriod
+            || Constants.CODE_SPACE != event.codePoint
+            || !isDoubleSpacePeriodCountdownActive(inputTransaction)
+        ) {
+            return false
+        }
+        val lastTwo = mConnection.getTextBeforeCursor(3, 0) ?: return false
+        val length = lastTwo.length
+        if (length < 2) return false
+        if (lastTwo[length - 1].code != Constants.CODE_SPACE) {
+            return false
+        }
+        val firstCodePoint = if (Character.isSurrogatePair(lastTwo[0], lastTwo[1])) {
+            Character.codePointAt(lastTwo, length - 3)
+        } else {
+            lastTwo[length - 2].code
+        }
+        if (canBeFollowedByDoubleSpacePeriod(firstCodePoint)) {
+            cancelDoubleSpacePeriodCountdown()
+            mConnection.deleteTextBeforeCursor(1)
+            val textToInsert = inputTransaction.settingsValues.mSpacingAndPunctuations.mSentenceSeparatorAndSpace
+            mConnection.commitText(textToInsert, 1)
+            inputTransaction.requireShiftUpdate(InputTransaction.SHIFT_UPDATE_NOW)
+            inputTransaction.setRequiresUpdateSuggestions()
+            return true
+        }
+        return false
+    }
+
+    private fun performRecapitalization(settingsValues: SettingsValues) {
+        mRecapitalizeStatus.enable()
+        if (!mConnection.hasSelection()) {
+            return
+        }
+        val selectionStart = mConnection.expectedSelectionStart
+        val selectionEnd = mConnection.expectedSelectionEnd
+        val numCharsSelected = selectionEnd - selectionStart
+        if (numCharsSelected > Constants.MAX_CHARACTERS_FOR_RECAPITALIZATION) {
+            return
+        }
+        if (!mRecapitalizeStatus.isStarted() || !mRecapitalizeStatus.isSetAt(selectionStart, selectionEnd)) {
+            val selectedText = mConnection.getSelectedText(0)
+            if (TextUtils.isEmpty(selectedText)) return
+            mRecapitalizeStatus.start(
+                selectedText.toString(), selectionStart, settingsValues.mLocale,
+                settingsValues.mSpacingAndPunctuations.mSortedWordSeparators
+            )
+        }
+        mConnection.finishComposingText()
+        mRecapitalizeStatus.rotate()
+        mConnection.setSelection(selectionEnd, selectionEnd)
+        mConnection.deleteTextBeforeCursor(numCharsSelected)
+        val replacement = mRecapitalizeStatus.textReplacement()
+        mConnection.commitText(replacement.text, 0)
+        mConnection.setSelection(replacement.selectionStart, replacement.selectionEnd())
+    }
+
+    /**
+     *  Rotates the capitalization of the composing word if the cursor is at its end and there is no selection:
+     *  lowercase -> Capitalized -> UPPERCASE -> lowercase, see [Settings.PREF_SHIFT_RECAPITALIZES_WORD].
+     *  @return whether the word was changed
+     */
+    private fun recapitalizeComposingWord(settingsValues: SettingsValues): Boolean {
+        if (KeyboardSwitcher.getInstance().isShiftChording) {
+            mTypedWordOnShiftPress = null
+            return false
+        }
+        val typedWordOnShiftPress = mTypedWordOnShiftPress
+        mTypedWordOnShiftPress = null
+        if (!settingsValues.mShiftRecapitalizesWord) return false
+        if (mConnection.hasSelection()) return false
+
+        val isComposing = mWordComposer.isComposingWord()
+        if (isComposing && mWordComposer.isCursorFrontOrMiddleOfComposingWord()) return false
+
+        val targetWord: String
+        val wordStart: Int
+        val deleteLength: Int
+
+        if (isComposing) {
+            targetWord = mWordComposer.getTypedWord()
+            if (targetWord != typedWordOnShiftPress) return false
+            wordStart = mConnection.expectedSelectionEnd - targetWord.length
+            deleteLength = 0
+        } else {
+            if (typedWordOnShiftPress.isNullOrEmpty()) return false
+            val wordLen = typedWordOnShiftPress.length
+            val expectedEnd = mConnection.expectedSelectionEnd
+            val hasTrailingSpace = mSpaceState == SpaceState.DOUBLE ||
+                (mSpaceState == SpaceState.PHANTOM && mConnection.codePointBeforeCursor == Constants.CODE_SPACE)
+            val trailingOffset = if (hasTrailingSpace) 1 else 0
+            val textBefore = mConnection.getTextBeforeCursor(wordLen + trailingOffset, 0)?.toString() ?: return false
+            val actualWord = if (trailingOffset > 0 && textBefore.endsWith(" ")) {
+                textBefore.substring(0, textBefore.length - 1)
+            } else {
+                textBefore
+            }
+            if (!actualWord.endsWith(typedWordOnShiftPress)) return false
+            targetWord = typedWordOnShiftPress
+            wordStart = expectedEnd - wordLen - trailingOffset
+            deleteLength = wordLen + trailingOffset
+        }
+
+        if (targetWord.isEmpty() || wordStart < 0) return false
+        mRecapitalizeStatus.enable()
+        if (!isRecapitalizingComposingWord()) {
+            mRecapitalizeStatus.start(
+                targetWord, wordStart, settingsValues.mLocale,
+                settingsValues.mSpacingAndPunctuations.mSortedWordSeparators
+            )
+            if (!mRecapitalizeStatus.isStarted()) return false
+        }
+        mRecapitalizeStatus.rotate()
+        val replacement = mRecapitalizeStatus.textReplacement().text
+        if (replacement == targetWord) {
+            // nothing to change (e.g. no letters), let shift do its normal work
+            mRecapitalizeStatus.stop()
+            return false
+        }
+        val codePoints = StringUtils.toCodePointArray(replacement)
+        // keys are found by their lower case letter, upper case letters would have no position
+        val coordinates = mLatinIME.getCoordinatesForCurrentKeyboard(codePoints.map { Character.toLowerCase(it) }.toIntArray())
+        // still the typed word, not one from existing text: suggestions and auto-correction as before the shift
+        val wasResumed = if (isComposing) mWordComposer.isResumed() else false
+        mConnection.beginBatchEdit()
+        try {
+            if (deleteLength > 0) {
+                mConnection.deleteTextBeforeCursor(deleteLength)
+            }
+            mWordComposer.setComposingWord(codePoints, coordinates, isResumed = wasResumed)
+            setComposingTextInternal(replacement, 1)
+        } finally {
+            mConnection.endBatchEdit()
+        }
+        mSpaceState = SpaceState.NONE
+        mLastComposedWord = LastComposedWord.NOT_A_COMPOSED_WORD
+        // typing should continue in the same case: caps lock for an upper case word, lower case otherwise
+        mCapsLockFromRecapitalize = mRecapitalizeStatus.getCurrentMode() == RecapitalizeMode.ALL_UPPER
+        KeyboardSwitcher.getInstance().setCapsLock(mCapsLockFromRecapitalize)
+        return true
+    }
+
+    /** To be called when the shift key is pressed down, necessary for [recapitalizeComposingWord]. */
+    fun onShiftKeyPressed() {
+        mTypedWordOnShiftPress = if (mWordComposer.isComposingWord()) {
+            mWordComposer.getTypedWord()
+        } else if (mLastComposedWord.isActive && mLastComposedWord.mCommittedWord.isNotEmpty()) {
+            mLastComposedWord.mCommittedWord.toString()
+        } else {
+            val range = mConnection.getWordRangeAtCursor(Settings.getValues().mSpacingAndPunctuations, Settings.getValues().mCurrentKeyboardScript)
+            range?.mWord?.toString()
+        }
+    }
+
+    /** whether the last recapitalization was done by [recapitalizeComposingWord] and the word is unchanged since */
+    private fun isRecapitalizingComposingWord(): Boolean {
+        if (!mRecapitalizeStatus.isStarted() || mConnection.hasSelection() || !mWordComposer.isComposingWord()) {
+            return false
+        }
+        val placement = mRecapitalizeStatus.textReplacement()
+        return placement.text == mWordComposer.getTypedWord()
+                && placement.selectionEnd() == mConnection.expectedSelectionEnd
+    }
+
+    internal fun performAdditionToUserHistoryDictionary(
+        settingsValues: SettingsValues,
+        suggestion: String,
+        ngramContext: NgramContext
+    ) {
+        if (!settingsValues.isSuggestionsEnabledPerUserSettings() || TextUtils.isEmpty(suggestion)) {
+            return
+        }
+        val wasAutoCapitalized = mWordComposer.wasAutoCapitalized() && !mWordComposer.isMostlyCaps()
+        val word = stripWordSeparatorsFromEnd(suggestion, settingsValues)
+        if (settingsValues.mIncognitoModeEnabled) {
+            mDictionaryFacilitator.adjustConfidences(word, wasAutoCapitalized)
+            return
+        }
+        if (mConnection.hasSlowInputConnection()) {
+            Log.w(TAG, "Skipping learning due to slow InputConnection.")
+            mDictionaryFacilitator.adjustConfidences(word, wasAutoCapitalized)
+            return
+        }
+        val timeStampInSeconds = TimeUnit.MILLISECONDS.toSeconds(System.currentTimeMillis())
+        mDictionaryFacilitator.addToUserHistory(
+            word, wasAutoCapitalized, ngramContext,
+            timeStampInSeconds, settingsValues.mBlockPotentiallyOffensive
+        )
+    }
+
+    private fun stripWordSeparatorsFromEnd(word: String, settingsValues: SettingsValues): String {
+        return if (settingsValues.mSpacingAndPunctuations.isWordSeparator(word.codePointBefore(word.length))) {
+            var endIndex = word.length - 1
+            while (endIndex != 0 && settingsValues.mSpacingAndPunctuations.isWordSeparator(word.codePointBefore(endIndex))) {
+                --endIndex
+            }
+            if (endIndex > 0) word.substring(0, endIndex) else word
+        } else {
+            word
+        }
+    }
+
+    fun performUpdateSuggestionStripSync(settingsValues: SettingsValues, inputStyle: Int) {
+        if (CjkInputManager.getInstance(mLatinIME).isCjkSubtypeActive(mLatinIME.richImm.currentSubtype)) {
+            return
+        }
+        var startTimeMillis = 0L
+        if (DebugFlags.DEBUG_ENABLED) {
+            startTimeMillis = System.currentTimeMillis()
+            Log.d(TAG, "performUpdateSuggestionStripSync()")
+        }
+        if (!settingsValues.needsToLookupSuggestions()) {
+            if (mWordComposer.isComposingWord()) {
+                Log.w(TAG, "Called updateSuggestionsOrPredictions but suggestions were not requested!")
+            }
+            mSuggestionStripViewAccessor.setSuggestions(SuggestedWords.getEmptyInstance())
+            return
+        }
+
+        if (!mWordComposer.isComposingWord()) {
+            val ngramContext = getNgramContextFromNthPreviousWordForSuggestion(settingsValues.mSpacingAndPunctuations, 1)
+            val isFirstWord = ngramContext.isBeginningOfSentenceContext
+            if (isFirstWord || !settingsValues.mBigramPredictionEnabled) {
+                mSuggestionStripViewAccessor.setNeutralSuggestionStrip()
+                return
+            }
+        }
+
+        val holder = AsyncResultHolder<SuggestedWords>("Suggest")
+        mInputLogicHandler.getSuggestedWords {
+            getSuggestedWords(
+                inputStyle, SuggestedWords.NOT_A_SEQUENCE_NUMBER
+            ) { suggestedWords ->
+                val typedWordString = mWordComposer.getTypedWord()
+                val typedWordInfo = SuggestedWordInfo(
+                    typedWordString, "", SuggestedWordInfo.MAX_SCORE, SuggestedWordInfo.KIND_TYPED,
+                    Dictionary.DICTIONARY_USER_TYPED, SuggestedWordInfo.NOT_AN_INDEX,
+                    SuggestedWordInfo.NOT_A_CONFIDENCE
+                )
+                if (suggestedWords != null && (suggestedWords.size() > 1 || typedWordString.length <= 1)) {
+                    holder.set(suggestedWords)
+                } else {
+                    holder.set(retrieveOlderSuggestions(typedWordInfo, mSuggestedWords))
+                }
+            }
+        }
+        val suggestedWords = holder.get(null, Constants.GET_SUGGESTED_WORDS_TIMEOUT.toLong())
+        if (suggestedWords != null) {
+            val isExternalVisible = mSuggestionStripViewAccessor.isExternalSuggestionVisible
+            if (isExternalVisible && !mWordComposer.isComposingWord()) {
+                return
+            }
+            if (!(suggestedWords.isPrediction && mLatinIME.tryShowExternalSuggestion())) {
+                mSuggestionStripViewAccessor.setSuggestions(suggestedWords)
+            }
+            if (!suggestedWords.isEmpty && settingsValues.isSuggestionsEnabledPerUserSettings()
+                && isInlineEmojiSearchAction()
+            ) {
+                mSuggestionStripViewAccessor.showSuggestionStrip()
+            }
+        }
+        if (DebugFlags.DEBUG_ENABLED && suggestedWords != null) {
+            Log.i("SuggestTrace", "updateStrip: composing=${mWordComposer.isComposingWord()}"
+                + " typedLen=${mWordComposer.getTypedWord().length}"
+                + " suggestedSize=${suggestedWords.size()}"
+                + " punctuation=${suggestedWords.isPunctuationSuggestions}")
+            val runTimeMillis = System.currentTimeMillis() - startTimeMillis
+            Log.d(TAG, "performUpdateSuggestionStripSync() : $runTimeMillis ms to finish")
+        }
+    }
+
+    fun restartSuggestionsOnWordTouchedByCursor(settingsValues: SettingsValues) {
+        if (CjkInputManager.getInstance(mLatinIME).isCjkSubtypeActive(mLatinIME.richImm.currentSubtype)) {
+            return
+        }
+        val currentKeyboardScript = settingsValues.mCurrentKeyboardScript
+        if (!settingsValues.mSpacingAndPunctuations.mCurrentLanguageHasSpaces
+            || !settingsValues.needsToLookupSuggestions()
+            || mInputLogicHandler.isInBatchInput()
+            || mConnection.hasSelection()
+            || mConnection.expectedSelectionStart < 0
+            || mConnection.hasSlowInputConnection()
+            || mConnection.hasRecentLargeCommit()
+        ) {
+            mSuggestionStripViewAccessor.setNeutralSuggestionStrip()
+            return
+        }
+
+        updateInlineEmojiSearch()
+        if (isInlineEmojiSearchAction()) {
+            mInputLogicHandler.getSuggestedWords {
+                getSuggestedWords(
+                    SuggestedWords.INPUT_STYLE_TYPING,
+                    SuggestedWords.NOT_A_SEQUENCE_NUMBER
+                ) { words ->
+                    if (words != null) doShowSuggestionsAndClearAutoCorrectionIndicator(words)
+                }
+            }
+            return
+        }
+
+        if (!mConnection.isCursorTouchingWord(settingsValues.mSpacingAndPunctuations, !mConnection.hasSlowInputConnection())) {
+            mWordComposer.setCapitalizedModeAtStartComposingTime(WordComposer.CAPS_MODE_OFF)
+            mLatinIME.mHandler.postUpdateSuggestionStrip(SuggestedWords.INPUT_STYLE_RECORRECTION)
+            mConnection.finishComposingText()
+            return
+        }
+        val range = mConnection.getWordRangeAtCursor(settingsValues.mSpacingAndPunctuations, currentKeyboardScript)
+            ?: return
+        if (range.length() <= 0) {
+            mLatinIME.setNeutralSuggestionStrip()
+            mConnection.finishComposingText()
+            return
+        }
+        if (range.mHasUrlSpans) return
+        if (!isResumableWord(settingsValues, range.mWord.toString())) {
+            mSuggestionStripViewAccessor.setNeutralSuggestionStrip()
+            mConnection.finishComposingText()
+            return
+        }
+        restartSuggestions(range, settingsValues)
+    }
+
+    private fun restartSuggestions(range: TextRange, settingsValues: SettingsValues) {
+        val numberOfCharsInWordBeforeCursor = range.getNumberOfCharsInWordBeforeCursor()
+        val expectedCursorPosition = mConnection.expectedSelectionStart
+        if (numberOfCharsInWordBeforeCursor > expectedCursorPosition) return
+        val wordStart = expectedCursorPosition - numberOfCharsInWordBeforeCursor
+        val wordEnd = expectedCursorPosition + range.getNumberOfCharsInWordAfterCursor()
+        mResumedWordStart = wordStart
+        mResumedWordEnd = wordEnd
+        val suggestions = ArrayList<SuggestedWordInfo>()
+        val typedWordString = range.mWord.toString()
+        val typedWordInfo = SuggestedWordInfo(
+            typedWordString,
+            "", SuggestedWords.MAX_SUGGESTIONS + 1,
+            SuggestedWordInfo.KIND_TYPED, Dictionary.DICTIONARY_USER_TYPED,
+            SuggestedWordInfo.NOT_AN_INDEX,
+            SuggestedWordInfo.NOT_A_CONFIDENCE
+        )
+        suggestions.add(typedWordInfo)
+        var i = 0
+        for (span in range.getSuggestionSpansAtWord()) {
+            for (s in span.suggestions) {
+                ++i
+                if (!TextUtils.equals(s, typedWordString)) {
+                    suggestions.add(
+                        SuggestedWordInfo(
+                            s,
+                            "", SuggestedWords.MAX_SUGGESTIONS - i,
+                            SuggestedWordInfo.KIND_RESUMED, Dictionary.DICTIONARY_RESUMED,
+                            SuggestedWordInfo.NOT_AN_INDEX,
+                            SuggestedWordInfo.NOT_A_CONFIDENCE
+                        )
+                    )
+                }
+            }
+        }
+        if (!TextUtils.isDigitsOnly(typedWordString)) {
+            val codePoints = StringUtils.toCodePointArray(typedWordString)
+            mWordComposer.setComposingWord(codePoints, mLatinIME.getCoordinatesForCurrentKeyboard(codePoints))
+            mWordComposer.setCursorPositionWithinWord(typedWordString.codePointCount(0, numberOfCharsInWordBeforeCursor))
+            mConnection.setComposingRegion(wordStart, wordEnd)
+        }
+        if (range.getNumberOfCharsInWordAfterCursor() == 0 || suggestions.size <= 1) {
+            mInputLogicHandler.getSuggestedWords {
+                getSuggestedWords(
+                    SuggestedWords.INPUT_STYLE_TYPING,
+                    SuggestedWords.NOT_A_SEQUENCE_NUMBER
+                ) { words ->
+                    if (words != null) doShowSuggestionsAndClearAutoCorrectionIndicator(words)
+                }
+            }
+        } else {
+            val suggestedWords = SuggestedWords(
+                suggestions, null, typedWordInfo, false,
+                false, false, SuggestedWords.INPUT_STYLE_RECORRECTION, SuggestedWords.NOT_A_SEQUENCE_NUMBER
+            )
+            doShowSuggestionsAndClearAutoCorrectionIndicator(suggestedWords)
+        }
+    }
+
+    private fun doShowSuggestionsAndClearAutoCorrectionIndicator(suggestedWords: SuggestedWords) {
+        mIsAutoCorrectionIndicatorOn = false
+        mLatinIME.mHandler.setSuggestions(suggestedWords)
+    }
+
+    private fun revertCommit(inputTransaction: InputTransaction) {
+        val originallyTypedWord = mLastComposedWord.mTypedWord
+        val committedWord = mLastComposedWord.mCommittedWord
+        val committedWordString = committedWord.toString()
+        val cancelLength = committedWord.length
+        val separatorString = mLastComposedWord.mSeparatorString
+        val hasTrailingSpace = separatorString == Constants.STRING_SPACE || (separatorString.isEmpty() && mConnection.codePointBeforeCursor == Constants.CODE_SPACE)
+        val usePhantomSpace = hasTrailingSpace
+        val separatorLength = if (separatorString.isNotEmpty()) separatorString.length else if (hasTrailingSpace) 1 else 0
+        val deleteLength = cancelLength + separatorLength
+        if (DebugFlags.DEBUG_ENABLED) {
+            if (mWordComposer.isComposingWord()) {
+                throw RuntimeException("revertCommit, but we are composing a word")
+            }
+            val wordBeforeCursor = mConnection.getTextBeforeCursor(deleteLength, 0)?.subSequence(0, cancelLength)
+            if (!TextUtils.equals(committedWord, wordBeforeCursor)) {
+                throw RuntimeException("revertCommit check failed: we thought we were reverting \"$committedWord\", but before the cursor we found \"$wordBeforeCursor\"")
+            }
+        }
+        mConnection.deleteTextBeforeCursor(deleteLength)
+        if (!TextUtils.isEmpty(committedWord)) {
+            unlearnWord(committedWordString, inputTransaction.settingsValues, Constants.EVENT_REVERT)
+        }
+        val stringToCommit = originallyTypedWord + (if (usePhantomSpace) "" else separatorString)
+        val textToCommit = SpannableString(stringToCommit)
+        if (committedWord is SpannableString) {
+            val spans = committedWord.getSpans(0, committedWord.length, Any::class.java)
+            val lastCharIndex = textToCommit.length - 1
+            val suggestions = ArrayList<String>()
+            suggestions.add(committedWordString)
+            for (span in spans) {
+                if (span is SuggestionSpan) {
+                    for (suggestion in span.suggestions) {
+                        if (suggestion != committedWordString) {
+                            suggestions.add(suggestion)
+                        }
+                    }
+                } else {
+                    textToCommit.setSpan(span, 0, lastCharIndex, committedWord.getSpanFlags(span))
+                }
+            }
+            textToCommit.setSpan(
+                SuggestionSpan(
+                    mLatinIME, inputTransaction.settingsValues.mLocale,
+                    suggestions.toTypedArray(), 0, null
+                ),
+                0, lastCharIndex, 0
+            )
+        }
+
+        if (inputTransaction.settingsValues.mSpacingAndPunctuations.mCurrentLanguageHasSpaces) {
+            mConnection.commitText(textToCommit, 1)
+            if (usePhantomSpace) {
+                mJustRevertedACommit = true
+                mSpaceState = SpaceState.PHANTOM
+            }
+        } else {
+            val codePoints = StringUtils.toCodePointArray(stringToCommit)
+            mWordComposer.setComposingWord(codePoints, mLatinIME.getCoordinatesForCurrentKeyboard(codePoints))
+            setComposingTextInternal(textToCommit, 1)
+        }
+        mLastComposedWord = LastComposedWord.NOT_A_COMPOSED_WORD
+        inputTransaction.setRequiresUpdateSuggestions()
+    }
+
+    private fun getActualCapsMode(settingsValues: SettingsValues, keyboardShiftMode: Int): Int {
+        if (keyboardShiftMode != WordComposer.CAPS_MODE_AUTO_SHIFTED) {
+            return keyboardShiftMode
+        }
+        val auto = getCurrentAutoCapsState(settingsValues)
+        if (0 != (auto and TextUtils.CAP_MODE_CHARACTERS)) {
+            return WordComposer.CAPS_MODE_AUTO_SHIFT_LOCKED
+        }
+        if (0 != auto) {
+            return WordComposer.CAPS_MODE_AUTO_SHIFTED
+        }
+        return WordComposer.CAPS_MODE_OFF
+    }
+
+    val isComposingWord: Boolean
+        get() = mWordComposer.isComposingWord()
+
+    fun getCurrentAutoCapsState(settingsValues: SettingsValues): Int {
+        if (!settingsValues.mAutoCap) return Constants.TextUtils.CAP_MODE_OFF
+
+        val ei = getCurrentInputEditorInfo() ?: return Constants.TextUtils.CAP_MODE_OFF
+        var inputType = ei.inputType
+        if (!InputTypeUtils.isAnyPasswordInputType(inputType)
+            && !InputTypeUtils.isUriOrEmailType(inputType)
+            && (inputType and InputType.TYPE_MASK_CLASS) == InputType.TYPE_CLASS_TEXT
+        ) {
+            if (settingsValues.mForceAutoCaps
+                || (inputType and (InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or InputType.TYPE_TEXT_FLAG_CAP_WORDS or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES)) == 0
+            ) {
+                inputType = inputType or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            }
+        }
+        return mConnection.getCursorCapsMode(
+            inputType, settingsValues.mSpacingAndPunctuations, SpaceState.PHANTOM == mSpaceState
+        )
+    }
+
+    fun getCurrentRecapitalizeState(): RecapitalizeMode? {
+        if (isRecapitalizingComposingWord()) {
+            // Shift is used for changing the word, not for the next letter. Reporting lower case keeps the
+            // normal shift handling out of the way (no one-time shift, no caps lock by double tap).
+            // Caps lock for an upper case word is set in recapitalizeComposingWord.
+            return RecapitalizeMode.ALL_LOWER
+        }
+        if (!mRecapitalizeStatus.isStarted()
+            || !mRecapitalizeStatus.isSetAt(mConnection.expectedSelectionStart, mConnection.expectedSelectionEnd)
+        ) {
+            return null
+        }
+        return mRecapitalizeStatus.getCurrentMode()
+    }
+
+    private fun getCurrentInputEditorInfo(): EditorInfo {
+        return mLatinIME.currentInputEditorInfo
+    }
+
+    fun getNgramContextFromNthPreviousWordForSuggestion(
+        spacingAndPunctuations: SpacingAndPunctuations,
+        nthPreviousWord: Int
+    ): NgramContext {
+        if (spacingAndPunctuations.mCurrentLanguageHasSpaces) {
+            return mConnection.getNgramContextFromNthPreviousWord(spacingAndPunctuations, nthPreviousWord)
+        }
+        if (LastComposedWord.NOT_A_COMPOSED_WORD == mLastComposedWord) {
+            return NgramContext.BEGINNING_OF_SENTENCE
+        }
+        return NgramContext(NgramContext.WordInfo(mLastComposedWord.mCommittedWord.toString()))
+    }
+
+    private fun performEditorAction(
+        actionId: Int,
+        settingsValues: SettingsValues,
+        handler: LatinIME.UIHandler
+    ) {
+        if (mWordComposer.isComposingWord()) {
+            val typedWord = mWordComposer.getTypedWord()
+            val ngramContext = mConnection.getNgramContextFromNthPreviousWord(settingsValues.mSpacingAndPunctuations, 1)
+            performAdditionToUserHistoryDictionary(settingsValues, typedWord, ngramContext)
+            mLastComposedWord = mWordComposer.commitWord(
+                LastComposedWord.COMMIT_TYPE_USER_TYPED_WORD, typedWord,
+                LastComposedWord.NOT_A_SEPARATOR, ngramContext
+            )
+            mConnection.finishComposingText()
+            StatsUtils.onWordCommitUserTyped(typedWord, mWordComposer.isBatchMode())
+        }
+        mConnection.performEditorAction(actionId)
+    }
+
+    private fun performSpecificTldProcessingOnTextInput(text: String): String {
+        if (text.length <= 1 || text[0] != Constants.CODE_PERIOD.toChar()
+            || !Character.isLetter(text[1])
+        ) {
+            return text
+        }
+        mSpaceState = SpaceState.NONE
+        val codePointBeforeCursor = mConnection.codePointBeforeCursor
+        if (Constants.CODE_PERIOD == codePointBeforeCursor) {
+            return text.substring(1)
+        }
+        return text
+    }
+
+    private fun onSettingsKeyPressed() {
+        mLatinIME.displaySettingsDialog()
+    }
+
+    private fun resetEntireInputState(
+        newSelStart: Int,
+        newSelEnd: Int,
+        clearSuggestionStrip: Boolean
+    ) {
+        val shouldFinishComposition = mWordComposer.isComposingWord()
+        resetComposingState(true /* alsoResetLastComposedWord */)
+        if (clearSuggestionStrip) {
+            mSuggestionStripViewAccessor.setNeutralSuggestionStrip()
+            mSuggestedWords = SuggestedWords.getEmptyInstance()
+        }
+        mConnection.resetCachesUponCursorMoveAndReturnSuccess(newSelStart, newSelEnd, shouldFinishComposition)
+    }
+
+    internal fun resetComposingState(alsoResetLastComposedWord: Boolean) {
+        mWordComposer.reset()
+        if (alsoResetLastComposedWord) {
+            mLastComposedWord = LastComposedWord.NOT_A_COMPOSED_WORD
+        }
+        mResumedWordStart = -1
+        mResumedWordEnd = -1
+    }
+
+    private fun getDictionaryFacilitatorLocale(): Locale {
+        return mDictionaryFacilitator.currentLocale ?: Locale.ROOT
+    }
+
+    private fun getTextWithUnderline(text: String): CharSequence {
+        return if (mIsAutoCorrectionIndicatorOn) {
+            getTextWithAutoCorrectionIndicatorUnderline(
+                mLatinIME, text, getDictionaryFacilitatorLocale()
+            )
+        } else {
+            text
+        }
+    }
+
+    fun sendDownUpKeyEvent(keyCode: Int) {
+        sendDownUpKeyEventWithMetaState(keyCode, 0)
+    }
+
+    fun sendDownUpKeyEventWithMetaState(keyCode: Int, metaState: Int) {
+        val eventTime = SystemClock.uptimeMillis()
+        mConnection.sendKeyEvent(
+            KeyEvent(
+                eventTime, eventTime,
+                KeyEvent.ACTION_DOWN, keyCode, 0, metaState, KeyCharacterMap.VIRTUAL_KEYBOARD, 0,
+                KeyEvent.FLAG_SOFT_KEYBOARD or KeyEvent.FLAG_KEEP_TOUCH_MODE
+            )
+        )
+        mConnection.sendKeyEvent(
+            KeyEvent(
+                SystemClock.uptimeMillis(), eventTime,
+                KeyEvent.ACTION_UP, keyCode, 0, metaState, KeyCharacterMap.VIRTUAL_KEYBOARD, 0,
+                KeyEvent.FLAG_SOFT_KEYBOARD or KeyEvent.FLAG_KEEP_TOUCH_MODE
+            )
+        )
+    }
+
+    private fun insertAutomaticSpaceIfOptionsAndTextAllow(settingsValues: SettingsValues) {
+        if (settingsValues.shouldInsertSpacesAutomatically()
+            && settingsValues.mSpacingAndPunctuations.mCurrentLanguageHasSpaces
+            && !textBeforeCursorMayBeUrlOrSimilar(settingsValues, true)
+            && !mConnection.textBeforeCursorLooksLikeURL()
+            && !(mConnection.codePointBeforeCursor == Constants.CODE_PERIOD
+                && mConnection.wordBeforeCursorMayBeEmail())
+        ) {
+            mConnection.commitCodePoint(Constants.CODE_SPACE)
+        }
+    }
+
+    private fun textBeforeCursorMayBeUrlOrSimilar(settingsValues: SettingsValues, forAutoSpace: Boolean): Boolean {
+        if (InputTypeUtils.isUriOrEmailType(settingsValues.mInputAttributes.mInputType)
+            && (if (forAutoSpace) {
+                mConnection.nonWordCodePointAndNoSpaceBeforeCursor(settingsValues.mSpacingAndPunctuations)
+            } else {
+                !mConnection.spaceBeforeCursor()
+            })
+        ) {
+            return true
+        }
+        if (settingsValues.mUrlDetectionEnabled
+            && settingsValues.mSpacingAndPunctuations.containsSometimesWordConnector(mWordComposer.getTypedWord())
+        ) {
+            return true
+        }
+        val textBeforeCursor = mConnection.getTextBeforeCursor(mWordComposer.getTypedWord().length + 3, 0)
+        if (textBeforeCursor != null && textBeforeCursor.toString().startsWith("://")) {
+            return true
+        }
+        return false
+    }
+
+    fun onUpdateTailBatchInputCompleted(
+        settingsValues: SettingsValues,
+        suggestedWords: SuggestedWords,
+        keyboardSwitcher: KeyboardSwitcher
+    ) {
+        val batchInputText = if (suggestedWords.isEmpty) null else suggestedWords.getWord(0)
+        if (batchInputText.isNullOrEmpty()) {
+            return
+        }
+        mConnection.beginBatchEdit()
+        try {
+            if (SpaceState.PHANTOM == mSpaceState) {
+                insertAutomaticSpaceIfOptionsAndTextAllow(settingsValues)
+                mSpaceState = SpaceState.NONE
+            }
+            enterInlineEmojiSearchIfNeeded(batchInputText.codePointAt(0), settingsValues)
+            mWordComposer.setBatchInputWord(batchInputText)
+            setComposingTextInternal(batchInputText, 1)
+        } finally {
+            mConnection.endBatchEdit()
+        }
+        if (settingsValues.mAutospaceAfterGestureTyping) {
+            mSpaceState = SpaceState.PHANTOM
+        }
+        keyboardSwitcher.requestUpdatingShiftState(
+            getCurrentAutoCapsState(settingsValues),
+            getCurrentRecapitalizeState()
+        )
+
+        if (isInlineEmojiSearchAction()) {
+            searchForEmojiInline(SuggestedWords.NOT_A_SEQUENCE_NUMBER) { words ->
+                if (words != null) mLatinIME.setSuggestions(words)
+            }
+        }
+    }
+
+    fun commitTyped(settingsValues: SettingsValues, separatorString: String): Boolean {
+        if (!mWordComposer.isComposingWord()) return false
+        val typedWord = mWordComposer.getTypedWord()
+        if (typedWord.isNotEmpty()) {
+            val isBatchMode = mWordComposer.isBatchMode()
+            val cursorMovedBack = commitChosenWord(settingsValues, typedWord, LastComposedWord.COMMIT_TYPE_USER_TYPED_WORD, separatorString)
+            StatsUtils.onWordCommitUserTyped(typedWord, isBatchMode)
+            return cursorMovedBack
+        }
+        return false
+    }
+
+    private fun commitCurrentAutoCorrection(
+        settingsValues: SettingsValues,
+        separator: String,
+        handler: LatinIME.UIHandler
+    ): Boolean {
+        if (handler.hasPendingUpdateSuggestions()) {
+            handler.cancelUpdateSuggestionStrip()
+            performUpdateSuggestionStripSync(settingsValues, SuggestedWords.INPUT_STYLE_TYPING)
+        }
+        val autoCorrectionOrNull = mWordComposer.getAutoCorrectionOrNull()
+        val typedWord = mWordComposer.getTypedWord()
+        val stringToCommit = autoCorrectionOrNull?.mWord ?: typedWord
+        if (!stringToCommit.isNullOrEmpty()) {
+            val isBatchMode = mWordComposer.isBatchMode()
+            val cursorMovedBack = commitChosenWord(settingsValues, stringToCommit, LastComposedWord.COMMIT_TYPE_DECIDED_WORD, separator)
+            if (typedWord != stringToCommit) {
+                mConnection.commitCorrection(
+                    CorrectionInfo(
+                        mConnection.expectedSelectionEnd - stringToCommit.length,
+                        typedWord, stringToCommit
+                    )
+                )
+                val prevWordsContext = autoCorrectionOrNull?.mPrevWordsContext ?: ""
+                StatsUtils.onAutoCorrection(
+                    typedWord, stringToCommit, isBatchMode,
+                    mDictionaryFacilitator, prevWordsContext
+                )
+                StatsUtils.onWordCommitAutoCorrect(stringToCommit, isBatchMode)
+            } else {
+                StatsUtils.onWordCommitUserTyped(stringToCommit, isBatchMode)
+            }
+            return cursorMovedBack
+        }
+        return false
+    }
+
+    private fun commitChosenWord(
+        settingsValues: SettingsValues,
+        chosenWord: String,
+        commitType: Int,
+        separatorString: String
+    ): Boolean {
+        var startTimeMillis = 0L
+        if (DebugFlags.DEBUG_ENABLED) {
+            startTimeMillis = System.currentTimeMillis()
+            Log.d(TAG, "commitChosenWord() : [$chosenWord]")
+        }
+        val isEnabled = TextExpanderUtils.isEnabled(mLatinIME)
+        if (isEnabled) {
+            val textBefore = mConnection.getTextBeforeCursor(50, 0)
+            if (textBefore != null) {
+                val textStr = textBefore.toString()
+                val result = TextExpanderUtils.getExpandedWordForTyped(chosenWord, textStr, mLatinIME)
+                if (result != null) {
+                    if (mJustRevertedExpandedShortcut != null
+                        && result.matchedString.equals(mJustRevertedExpandedShortcut, ignoreCase = true)
+                    ) {
+                        // Skip re-expanding
+                    } else {
+                        mConnection.commitText(getTextWithSuggestionSpan(mLatinIME, chosenWord, mSuggestedWords, getDictionaryFacilitatorLocale()), 1)
+                        mConnection.deleteTextBeforeCursor(result.prefixLength + chosenWord.length)
+                        val cursorMovedBack = commitExpandedText(result.matchedString, result.expandedText)
+                        resetComposingState(true)
+                        if (cursorMovedBack) {
+                            mSpaceState = SpaceState.NONE
+                        }
+                        return cursorMovedBack
+                    }
+                }
+            }
+        }
+        val chosenWordWithSuggestions = getTextWithSuggestionSpan(
+            mLatinIME, chosenWord, mSuggestedWords, getDictionaryFacilitatorLocale()
+        )
+        if (DebugFlags.DEBUG_ENABLED) {
+            var runTimeMillis = System.currentTimeMillis() - startTimeMillis
+            Log.d(TAG, "commitChosenWord() : $runTimeMillis ms to run SuggestionSpanUtils.getTextWithSuggestionSpan()")
+            startTimeMillis = System.currentTimeMillis()
+        }
+        val ngramContext = mConnection.getNgramContextFromNthPreviousWord(
+            settingsValues.mSpacingAndPunctuations, if (mWordComposer.isComposingWord()) 2 else 1
+        )
+        if (DebugFlags.DEBUG_ENABLED) {
+            var runTimeMillis = System.currentTimeMillis() - startTimeMillis
+            Log.d(TAG, "commitChosenWord() : $runTimeMillis ms to run Connection.getNgramContextFromNthPreviousWord()")
+            Log.d(TAG, "commitChosenWord() : NgramContext = $ngramContext")
+            startTimeMillis = System.currentTimeMillis()
+        }
+        if (mWordComposer.isResumed() && mResumedWordStart >= 0 && mResumedWordEnd > mResumedWordStart) {
+            if (!mConnection.hasComposingText() || AppQuirksManager.shouldUseSelectionForWordReplacement(mLatinIME.currentInputEditorInfo?.packageName)) {
+                mConnection.finishComposingText()
+                mConnection.setSelection(mResumedWordStart, mResumedWordEnd)
+            }
+        }
+        mConnection.commitText(chosenWordWithSuggestions, 1)
+        mResumedWordStart = -1
+        mResumedWordEnd = -1
+        if (DebugFlags.DEBUG_ENABLED) {
+            var runTimeMillis = System.currentTimeMillis() - startTimeMillis
+            Log.d(TAG, "commitChosenWord() : $runTimeMillis ms to run Connection.commitText")
+            startTimeMillis = System.currentTimeMillis()
+        }
+        performAdditionToUserHistoryDictionary(settingsValues, chosenWord, ngramContext)
+        if (DebugFlags.DEBUG_ENABLED) {
+            var runTimeMillis = System.currentTimeMillis() - startTimeMillis
+            Log.d(TAG, "commitChosenWord() : $runTimeMillis ms to run performAdditionToUserHistoryDictionary()")
+            startTimeMillis = System.currentTimeMillis()
+        }
+        mLastComposedWord = mWordComposer.commitWord(commitType, chosenWord, separatorString, ngramContext)
+        if (DebugFlags.DEBUG_ENABLED) {
+            val runTimeMillis = System.currentTimeMillis() - startTimeMillis
+            Log.d(TAG, "commitChosenWord() : $runTimeMillis ms to run WordComposer.commitWord()")
+        }
+        return false
+    }
+
+    private fun wrapSelection(start: Int, end: Int) {
+        val selected = mConnection.getSelectedText(0) ?: ""
+        if (mConnection.codePointBeforeCursor == start) {
+            val afterCursor = mConnection.getTextAfterCursor(1, 0)
+            if (!afterCursor.isNullOrEmpty() && afterCursor[0].code == end) {
+                mConnection.setSelection(mConnection.expectedSelectionStart - 1, mConnection.expectedSelectionEnd + 1)
+                mConnection.commitText(selected, 1)
+                return
+            }
+        }
+        mConnection.commitText(
+            StringUtils.newSingleCodePointString(start) + selected + StringUtils.newSingleCodePointString(end), 1
+        )
+    }
+
+    fun retryResetCachesAndReturnSuccess(
+        tryResumeSuggestions: Boolean,
+        remainingTries: Int,
+        handler: LatinIME.UIHandler
+    ): Boolean {
+        val shouldFinishComposition = mConnection.hasSelection() || !mConnection.isCursorPositionKnown()
+        if (!mConnection.resetCachesUponCursorMoveAndReturnSuccess(
+                mConnection.expectedSelectionStart, mConnection.expectedSelectionEnd, shouldFinishComposition
+            )
+        ) {
+            if (0 < remainingTries) {
+                handler.postResetCaches(tryResumeSuggestions, remainingTries - 1)
+                return false
+            }
+        }
+        mConnection.tryFixIncorrectCursorPosition()
+        if (tryResumeSuggestions) {
+            handler.postResumeSuggestions(true /* shouldDelay */)
+        }
+        return true
+    }
+
+    fun getSuggestedWords(
+        inputStyle: Int,
+        sequenceNumber: Int,
+        callback: Suggest.OnGetSuggestedWordsCallback
+    ) {
+        val keyboard = KeyboardSwitcher.getInstance().keyboard
+        if (keyboard == null) {
+            callback.onGetSuggestedWords(SuggestedWords.getEmptyInstance())
+            return
+        }
+        if (inputStyle != SuggestedWords.INPUT_STYLE_UPDATE_BATCH
+            && inputStyle != SuggestedWords.INPUT_STYLE_TAIL_BATCH
+            && isInlineEmojiSearchAction()
+        ) {
+            searchForEmojiInline(sequenceNumber, callback)
+            return
+        }
+        val settingsValues = Settings.getValues()
+        mWordComposer.adviseCapitalizedModeBeforeFetchingSuggestions(
+            getActualCapsMode(settingsValues, KeyboardSwitcher.getInstance().keyboardShiftMode)
+        )
+        try {
+            val suggestedWords = mSuggest.getSuggestedWords(
+                mWordComposer,
+                getNgramContextFromNthPreviousWordForSuggestion(
+                    settingsValues.mSpacingAndPunctuations,
+                    if (mWordComposer.isComposingWord()) 2 else 1
+                ),
+                keyboard,
+                settingsValues.mSettingsValuesForSuggestion,
+                settingsValues.mAutoCorrectEnabled,
+                inputStyle, sequenceNumber
+            )
+            callback.onGetSuggestedWords(suggestedWords)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error fetching suggested words, using empty words instead", e)
+            callback.onGetSuggestedWords(SuggestedWords.getEmptyInstance())
+            KeyboardSwitcher.getInstance().showToast(mLatinIME.getString(R.string.error_getting_suggestions), true)
+        }
+    }
+
+    private fun setComposingTextInternal(newComposingText: CharSequence, newCursorPosition: Int) {
+        setComposingTextInternalWithBackgroundColor(
+            newComposingText, newCursorPosition, Color.TRANSPARENT, newComposingText.length
+        )
+    }
+
+    private fun setComposingTextInternalWithBackgroundColor(
+        newComposingText: CharSequence,
+        newCursorPosition: Int,
+        backgroundColor: Int,
+        coloredTextLength: Int
+    ) {
+        if (!mConnection.setComposingTextWithBackgroundColor(
+                newComposingText, newCursorPosition, backgroundColor, coloredTextLength
+            )
+        ) {
+            mWordComposer.reset()
+        }
+    }
+
+    fun getPrivateCommandPerformer(): PrivateCommandPerformer {
+        return mConnection
+    }
+
+    fun getComposingStart(): Int {
+        if (!mConnection.isCursorPositionKnown() || mConnection.hasSelection()) {
+            return -1
+        }
+        return mConnection.expectedSelectionStart - mWordComposer.size()
+    }
+
+    fun getComposingLength(): Int {
+        return mWordComposer.size()
+    }
+
+    private fun enterInlineEmojiSearchIfNeeded(codePoint: Int, settingsValues: SettingsValues) {
+        if (!settingsValues.mInlineEmojiSearch || mEmojiDictionaryFacilitator == null || isInlineEmojiSearchAction()) {
+            return
+        }
+        if (isStartOfInlineEmojiSearch(
+                codePoint, mConnection.codePointBeforeCursor,
+                mConnection.charBeforeBeforeCursor, settingsValues
+            )
+        ) {
+            setInlineEmojiSearchAction(true)
+        }
+    }
+
+    private fun updateInlineEmojiSearch() {
+        if (!Settings.getValues().mInlineEmojiSearch || mEmojiDictionaryFacilitator == null) {
+            if (isInlineEmojiSearchAction()) {
+                setInlineEmojiSearchAction(false)
+            }
+            return
+        }
+        setInlineEmojiSearchAction(getInlineEmojiSearchString() != null)
+    }
+
+    private fun setInlineEmojiSearchAction(on: Boolean) {
+        if (on != isInlineEmojiSearchAction()) {
+            KeyboardSwitcher.getInstance().loadKeyboard(
+                mLatinIME.currentInputEditorInfo, Settings.getValues(),
+                mLatinIME.currentAutoCapsState, mLatinIME.currentRecapitalizeState,
+                if (on) KeyboardLayoutSet.InternalAction(KeyCode.INLINE_EMOJI_SEARCH_DONE, "!icon/close_history") else null
+            )
+        }
+    }
+
+    private fun searchForEmojiInline(sequenceNumber: Int, callback: Suggest.OnGetSuggestedWordsCallback) {
+        val input = getInlineEmojiSearchString()
+        if (input.isNullOrEmpty()) {
+            callback.onGetSuggestedWords(SuggestedWords.getEmptyInstance())
+            return
+        }
+
+        val suggestions = mEmojiDictionaryFacilitator?.getSuggestions(input.splitOnWhitespace())
+        if (suggestions == null || suggestions.isEmpty()) {
+            callback.onGetSuggestedWords(SuggestedWords.getEmptyInstance())
+            return
+        }
+
+        val typedWordInfo = SuggestedWordInfo(
+            input, "", SuggestedWordInfo.MAX_SCORE, SuggestedWordInfo.KIND_TYPED,
+            Dictionary.DICTIONARY_USER_TYPED, SuggestedWordInfo.NOT_AN_INDEX, SuggestedWordInfo.NOT_A_CONFIDENCE
+        )
+        val suggestedWordInfos = ArrayList<SuggestedWordInfo>(suggestions.size + 1)
+        suggestedWordInfos.add(typedWordInfo)
+        for (suggestion in suggestions) {
+            if (suggestion.isEmoji) {
+                Suggest.addDebugInfo(suggestion, input)
+                suggestedWordInfos.add(suggestion)
+            }
+        }
+        callback.onGetSuggestedWords(
+            SuggestedWords(
+                suggestedWordInfos, suggestions.mRawSuggestions, typedWordInfo,
+                false, false, false, SuggestedWords.INPUT_STYLE_TYPING, sequenceNumber
+            )
+        )
+    }
+
+    private fun deleteTextReplacedByEmoji() {
+        mConnection.finishComposingText()
+        val inlineEmojiSearchString = getInlineEmojiSearchString()
+        if (inlineEmojiSearchString != null) {
+            mConnection.deleteTextBeforeCursor(inlineEmojiSearchString.length + 1)
+        } else {
+            Log.e("inlineEmojiSearch", "Inconsistent state - inlineEmojiSearchString is null")
+        }
+    }
+
+    private fun getInlineEmojiSearchString(): String? {
+        if (mEmojiDictionaryFacilitator == null) {
+            return null
+        }
+        return getInlineEmojiSearchString(mConnection.getTextBeforeCursor(50, 0))
+    }
+
+    fun updateEmojiDictionary(locale: Locale?) {
+        val sv = Settings.getValues()
+        if (sv.mInlineEmojiSearch && sv.needsToLookupSuggestions() && locale != null) {
+            val facilitator = mEmojiDictionaryFacilitator
+            if (facilitator == null || !facilitator.isForLocale(locale)) {
+                closeEmojiDictionary()
+                val dictFile = DictionaryInfoUtils.getCachedDictForLocaleAndType(locale, "emoji", mLatinIME)
+                val dictionary = if (dictFile != null) DictionaryFactory.getDictionary(dictFile, locale) else null
+                mEmojiDictionaryFacilitator = if (dictionary != null) SingleDictionaryFacilitator(dictionary) else null
+            }
+        } else {
+            closeEmojiDictionary()
+        }
+    }
+
+    private fun closeEmojiDictionary() {
+        mEmojiDictionaryFacilitator?.closeDictionaries()
+        mEmojiDictionaryFacilitator = null
+    }
+
+    private fun handleCustomAIKey(index: Int) {
+        val prefs = helium314.keyboard.latin.utils.DeviceProtectedUtils.getSharedPreferences(mLatinIME)
+        var prompt = prefs.getString("pref_custom_ai_prompt_$index", "") ?: ""
+        val systemInstructionBuilder = StringBuilder()
+        var shouldAppend = false
+
+        if (prompt.contains("#editor")) {
+            systemInstructionBuilder.append(" You are a text editor tool. Output ONLY the edited text. Do not add any conversational filler.")
+            prompt = prompt.replace("#editor", "").trim()
+        }
+        if (prompt.contains("#outputonly")) {
+            systemInstructionBuilder.append(" Output ONLY the result. Do not add introductions or explanations.")
+            prompt = prompt.replace("#outputonly", "").trim()
+        }
+        if (prompt.contains("#proofread")) {
+            systemInstructionBuilder.append(" You are a proofreader. Fix grammar and spelling errors. Output ONLY the fixed text.")
+            prompt = prompt.replace("#proofread", "").trim()
+        }
+        if (prompt.contains("#paraphrase")) {
+            systemInstructionBuilder.append(" You are a paraphrasing tool. Rewrite the text using different words while keeping the meaning. Output ONLY the result.")
+            prompt = prompt.replace("#paraphrase", "").trim()
+        }
+        if (prompt.contains("#summarize")) {
+            systemInstructionBuilder.append(" You are a summarizer. Provide a concise summary of the text. Output ONLY the summary.")
+            prompt = prompt.replace("#summarize", "").trim()
+        }
+        if (prompt.contains("#expand")) {
+            systemInstructionBuilder.append(" You are a creative writing assistant. Expand on the text with more details. Output ONLY the result.")
+            prompt = prompt.replace("#expand", "").trim()
+        }
+        if (prompt.contains("#toneshift")) {
+            systemInstructionBuilder.append(" You are a tone modifier. Adjust the tone as requested. Output ONLY the result.")
+            prompt = prompt.replace("#toneshift", "").trim()
+        }
+        if (prompt.contains("#generate")) {
+            systemInstructionBuilder.append(" You are a creative content generator. Output ONLY the generated content.")
+            prompt = prompt.replace("#generate", "").trim()
+        }
+        val systemInstruction = systemInstructionBuilder.toString()
+
+        if (prompt.contains("#append")) {
+            shouldAppend = true
+            prompt = prompt.replace("#append", "").trim()
+        }
+
+        var showThinking = false
+        if (prompt.contains("#showthought")) {
+            showThinking = true
+            prompt = prompt.replace("#showthought", "").trim()
+        }
+
+        if (TextUtils.isEmpty(prompt)) {
+            KeyboardSwitcher.getInstance().showToast(mLatinIME.getString(R.string.custom_ai_key_not_set), true)
+            return
+        }
+
+        prompt = CustomAIKeyText.withInstructions(prompt, systemInstruction)
+
+        var textToProcess: String
+        val hasSelection = mConnection.hasSelection()
+
+        if (hasSelection) {
+            val selectedText = mConnection.getSelectedText(0)
+            textToProcess = selectedText?.toString() ?: ""
+            if (shouldAppend) {
+                mConnection.setSelection(mConnection.expectedSelectionEnd, mConnection.expectedSelectionEnd)
+            }
+        } else {
+            val maxChars = 60000
+            var textBefore: CharSequence? = null
+            var textAfter: CharSequence? = null
+            try {
+                textBefore = mConnection.getTextBeforeCursor(maxChars, 0)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to get text before cursor: $e")
+            }
+
+            try {
+                textAfter = mConnection.getTextAfterCursor(maxChars, 0)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to get text after cursor: $e")
+                try {
+                    textAfter = mConnection.getTextAfterCursor(2048, 0)
+                } catch (e2: Exception) {
+                    Log.e(TAG, "Failed to get text after cursor (retry): $e2")
+                }
+            }
+
+            val before = textBefore?.toString() ?: ""
+            val after = textAfter?.toString() ?: ""
+            textToProcess = before + after
+
+            if (!shouldAppend) {
+                mConnection.selectAll()
+            } else {
+                if (textToProcess.isNotEmpty()) {
+                    if (after.isNotEmpty() && mConnection.expectedSelectionEnd >= 0) {
+                        val newPos = mConnection.expectedSelectionEnd + after.length
+                        mConnection.setSelection(newPos, newPos)
+                    }
+                }
+            }
+        }
+
+        val targetEditorInfo = getCurrentInputEditorInfo()
+        val targetPackage = targetEditorInfo?.packageName
+        val targetFieldId = targetEditorInfo?.fieldId
+
+        ProofreadHelper.customAsync(
+            mLatinIME,
+            textToProcess, prompt, hasSelection, showThinking,
+            onSuccess = { resultText ->
+                if (!mLatinIME.isInputViewShown || !mConnection.isConnected()) {
+                    Log.w(TAG, "Input view hidden or disconnected during custom AI operation, ignoring result")
+                    return@customAsync
+                }
+                val currentEditor = getCurrentInputEditorInfo()
+                if (currentEditor?.packageName != targetPackage || currentEditor?.fieldId != targetFieldId) {
+                    Log.w(TAG, "Target editor changed during custom AI operation, ignoring result")
+                    return@customAsync
+                }
+                if (shouldAppend) {
+                    val textBefore = mConnection.getTextBeforeCursor(2, 0) ?: ""
+                    mLatinIME.onTextInput(CustomAIKeyText.separatorBefore(textBefore) + resultText.trim())
+                } else if (!hasSelection) {
+                    mConnection.replaceEntireText(resultText)
+                } else {
+                    mLatinIME.onTextInput(resultText)
+                }
+            },
+            onError = { errorMessage ->
+                Log.e(TAG, "Custom AI Error: $errorMessage")
+                KeyboardSwitcher.getInstance().showToast(mLatinIME.getString(R.string.ai_error_format, errorMessage), true)
+            }
+        )
+    }
+
+    private fun tryJumpToNextPlaceholder(): Boolean {
+        val before = mConnection.getTextBeforeCursor(1000, 0)
+        val after = mConnection.getTextAfterCursor(1000, 0)
+        val beforeStr = before?.toString() ?: ""
+        val afterStr = after?.toString() ?: ""
+        val fullText = beforeStr + afterStr
+
+        if (DebugFlags.DEBUG_ENABLED) {
+            Log.d(TAG, "tryJumpToNextPlaceholder: beforeStr=[$beforeStr] afterStr=[$afterStr]")
+        }
+
+        val matcher = CURSOR_PATTERN.matcher(fullText)
+
+        var bestStart = -1
+        var bestEnd = -1
+        var lowestNum = Int.MAX_VALUE
+
+        while (matcher.find()) {
+            try {
+                val num = matcher.group(1)?.toInt() ?: continue
+                if (DebugFlags.DEBUG_ENABLED) {
+                    Log.d(TAG, "tryJumpToNextPlaceholder: found %cursor$num% at [${matcher.start()},${matcher.end()})")
+                }
+                if (num < lowestNum) {
+                    lowestNum = num
+                    bestStart = matcher.start()
+                    bestEnd = matcher.end()
+                }
+            } catch (e: NumberFormatException) {
+                // ignore
+            }
+        }
+
+        if (bestStart != -1) {
+            mConnection.finishComposingText()
+            mConnection.tryFixIncorrectCursorPosition()
+            resetComposingState(true)
+
+            val before2 = mConnection.getTextBeforeCursor(1000, 0)
+            val beforeStr2 = before2?.toString() ?: ""
+            val cursorPositionInFull = beforeStr2.length
+
+            val currentSelectionEnd = mConnection.expectedSelectionEnd
+            val targetStart = currentSelectionEnd - cursorPositionInFull + bestStart
+            val targetEnd = currentSelectionEnd - cursorPositionInFull + bestEnd
+            if (DebugFlags.DEBUG_ENABLED) {
+                Log.d(TAG, "tryJumpToNextPlaceholder: jumping to [$targetStart,$targetEnd) currentSelEnd=$currentSelectionEnd")
+            }
+            mConnection.beginBatchEdit()
+            try {
+                mConnection.setSelection(targetStart, targetEnd)
+                mConnection.commitText("", 1)
+            } finally {
+                mConnection.endBatchEdit()
+            }
+            return true
+        }
+        if (DebugFlags.DEBUG_ENABLED) {
+            Log.d(TAG, "tryJumpToNextPlaceholder: no placeholder found")
+        }
+        return false
+    }
+
+    private fun commitExpandedText(shortcut: String, expanded: String): Boolean {
+        val cursorOffset = expanded.indexOf("%cursor%")
+        if (cursorOffset != -1) {
+            val finalExpandedText = expanded.replace("%cursor%", "")
+            mConnection.commitText(finalExpandedText, 1)
+            mLastExpandedText = finalExpandedText
+            mLastShortcutText = shortcut
+            mLastExpandedCursorOffset = cursorOffset
+            val moveBackAmount = finalExpandedText.length - cursorOffset
+            if (moveBackAmount > 0) {
+                val newCursorPos = mConnection.expectedSelectionEnd - moveBackAmount
+                mConnection.setSelection(newCursorPos, newCursorPos)
+            }
+            mLastExpandedCursorPosition = mConnection.expectedSelectionEnd
+            return moveBackAmount > 0
+        }
+
+        val matcher = CURSOR_PATTERN.matcher(expanded)
+        var bestStart = -1
+        var bestEnd = -1
+        var lowestNum = Int.MAX_VALUE
+        while (matcher.find()) {
+            try {
+                val num = matcher.group(1)?.toInt() ?: continue
+                if (num < lowestNum) {
+                    lowestNum = num
+                    bestStart = matcher.start()
+                    bestEnd = matcher.end()
+                }
+            } catch (e: NumberFormatException) {
+                // ignore
+            }
+        }
+
+        if (bestStart != -1) {
+            val finalExpandedText = expanded.substring(0, bestStart) + expanded.substring(bestEnd)
+            mConnection.commitText(finalExpandedText, 1)
+            mLastExpandedText = finalExpandedText
+            mLastShortcutText = shortcut
+            mLastExpandedCursorOffset = bestStart
+            val moveBackAmount = finalExpandedText.length - bestStart
+            if (moveBackAmount > 0) {
+                val newCursorPos = mConnection.expectedSelectionEnd - moveBackAmount
+                mConnection.setSelection(newCursorPos, newCursorPos)
+            }
+            mLastExpandedCursorPosition = mConnection.expectedSelectionEnd
+            return moveBackAmount > 0
+        } else {
+            mConnection.commitText(expanded, 1)
+            mLastExpandedText = expanded
+            mLastShortcutText = shortcut
+            mLastExpandedCursorOffset = expanded.length
+            mLastExpandedCursorPosition = mConnection.expectedSelectionEnd
+            return false
+        }
+    }
+
+    companion object {
+        private const val TAG = "InputLogic"
+        private const val INLINE_EMOJI_SEARCH_MARKER = ':'
+        private const val KEY_REPEAT_INTERVAL_MS = 50
+        /** interval before the second word, it gets shorter with each word until the minimum */
+        private const val BACKSPACE_WORD_START_INTERVAL = 350f
+        private const val BACKSPACE_WORD_ACCELERATION = 0.8f
+        private const val BACKSPACE_WORD_MIN_INTERVAL = 80f
+
+        /** Time until the next word is deleted, after [wordsDeleted] words were deleted already */
+        fun getBackspaceWordInterval(wordsDeleted: Int): Float {
+            var interval = BACKSPACE_WORD_START_INTERVAL
+            repeat(wordsDeleted.coerceAtMost(30)) { interval *= BACKSPACE_WORD_ACCELERATION }
+            return interval.coerceAtLeast(BACKSPACE_WORD_MIN_INTERVAL)
+        }
+        private const val BACKSPACE_WORD_LOOKBACK = 200
+        private val THAI_LOCALE = Locale.forLanguageTag("th")
+        private val THAI_WORD_BREAK_ITERATOR = object : ThreadLocal<BreakIterator>() {
+            override fun initialValue(): BreakIterator = BreakIterator.getWordInstance(THAI_LOCALE)
+        }
+        private val CURSOR_PATTERN = java.util.regex.Pattern.compile("%cursor(\\d+)%")
+
+        /**
+         * Index where the word before the end of [text] starts, including whitespace and punctuation
+         * after it, but keeping the whitespace before it (so "one two " -> "one ").
+         */
+        internal fun getStartOfPreviousWord(text: String): Int {
+            var i = text.length
+            fun skipWhile(predicate: (Int) -> Boolean) {
+                while (i > 0) {
+                    val cp = Character.codePointBefore(text, i)
+                    if (!predicate(cp)) break
+                    i -= Character.charCount(cp)
+                }
+            }
+            skipWhile { Character.isWhitespace(it) }
+            skipWhile { !Character.isLetterOrDigit(it) && !Character.isWhitespace(it) }
+            skipWhile { Character.isLetterOrDigit(it) }
+            return i
+        }
+
+        fun isSpaceStrippingPunctuation(codePoint: Int): Boolean {
+            return codePoint == '.'.code
+                || codePoint == ','.code
+                || codePoint == ';'.code
+                || codePoint == ':'.code
+                || codePoint == '!'.code
+                || codePoint == '?'.code
+                || codePoint == ')'.code
+                || codePoint == ']'.code
+                || codePoint == '}'.code
+                || codePoint == '؟'.code
+                || codePoint == '،'.code
+                || codePoint == '؛'.code
+                || codePoint == '।'.code
+                || codePoint == '॥'.code
+                || codePoint == '。'.code
+                || codePoint == '、'.code
+                || codePoint == '，'.code
+                || codePoint == '？'.code
+                || codePoint == '！'.code
+                || codePoint == '：'.code
+                || codePoint == '；'.code
+                || codePoint == '）'.code
+                || codePoint == '】'.code
+                || codePoint == '』'.code
+        }
+
+        fun canBeFollowedByDoubleSpacePeriod(codePoint: Int): Boolean {
+            return Character.isLetterOrDigit(codePoint)
+                || codePoint == Constants.CODE_SINGLE_QUOTE
+                || codePoint == Constants.CODE_DOUBLE_QUOTE
+                || codePoint == Constants.CODE_CLOSING_PARENTHESIS
+                || codePoint == Constants.CODE_CLOSING_SQUARE_BRACKET
+                || codePoint == Constants.CODE_CLOSING_CURLY_BRACKET
+                || codePoint == Constants.CODE_CLOSING_ANGLE_BRACKET
+                || codePoint == Constants.CODE_PLUS
+                || codePoint == Constants.CODE_PERCENT
+                || Character.getType(codePoint) == Character.OTHER_SYMBOL.toInt()
+        }
+
+        fun retrieveOlderSuggestions(
+            typedWordInfo: SuggestedWordInfo,
+            previousSuggestedWords: SuggestedWords
+        ): SuggestedWords {
+            val prevWord = previousSuggestedWords.typedWordInfo?.mWord
+            val oldSuggestedWords = if (previousSuggestedWords.isPunctuationSuggestions
+                || previousSuggestedWords.isPrediction
+                || previousSuggestedWords.isEmpty
+                || prevWord.isNullOrEmpty()
+                || (!typedWordInfo.mWord.startsWith(prevWord, ignoreCase = true)
+                    && !prevWord.startsWith(typedWordInfo.mWord, ignoreCase = true))
+            ) {
+                SuggestedWords.getEmptyInstance()
+            } else {
+                previousSuggestedWords
+            }
+            val typedWordAndPreviousSuggestions = SuggestedWords.getTypedWordAndPreviousSuggestions(
+                typedWordInfo, oldSuggestedWords
+            )
+            return SuggestedWords(
+                typedWordAndPreviousSuggestions, null,
+                typedWordInfo, false, false,
+                true, oldSuggestedWords.mInputStyle,
+                SuggestedWords.NOT_A_SEQUENCE_NUMBER
+            )
+        }
+
+        fun isResumableWord(settings: SettingsValues, word: String): Boolean {
+            val firstCodePoint = word.codePointAt(0)
+            return settings.isWordCodePoint(firstCodePoint)
+                && Constants.CODE_SINGLE_QUOTE != firstCodePoint
+                && Constants.CODE_DASH != firstCodePoint
+        }
+
+        fun isInlineEmojiSearchAction(): Boolean {
+            val keyboard = KeyboardSwitcher.getInstance().keyboard
+            val internalAction = keyboard?.mId?.mInternalAction
+            return internalAction != null && internalAction.code() == KeyCode.INLINE_EMOJI_SEARCH_DONE
+        }
+
+        fun isInlineEmojiSearchChar(codePoint: Int): Boolean {
+            return Character.isLetterOrDigit(codePoint) || codePoint == '_'.code || codePoint == '+'.code || codePoint == '-'.code
+        }
+
+        fun getInlineEmojiSearchString(textBeforeCursor: CharSequence?): String? {
+            if (textBeforeCursor == null) {
+                return null
+            }
+
+            val text = textBeforeCursor.toString()
+            val markerIndex = text.lastIndexOf(INLINE_EMOJI_SEARCH_MARKER)
+            if (markerIndex < 0 || text.length < markerIndex + 2) {
+                return null
+            }
+
+            if (markerIndex > 0
+                && !isValidInlineEmojiSearchPreviousChar(text.codePointAt(markerIndex - 1), Settings.getValues())
+            ) {
+                return null
+            }
+
+            val searchString = text.substring(markerIndex + 1)
+            for (i in 0 until searchString.length) {
+                if (!isInlineEmojiSearchChar(searchString.codePointAt(i))) {
+                    return null
+                }
+            }
+
+            return searchString
+        }
+
+        fun isStartOfInlineEmojiSearch(
+            codePoint: Int,
+            codePointBeforeCursor: Int,
+            charBeforeBeforeCursor: Int,
+            settingsValues: SettingsValues
+        ): Boolean {
+            return codePointBeforeCursor == INLINE_EMOJI_SEARCH_MARKER.code && codePoint != INLINE_EMOJI_SEARCH_MARKER.code
+                && isInlineEmojiSearchChar(codePoint)
+                && isValidInlineEmojiSearchPreviousChar(charBeforeBeforeCursor, settingsValues)
+        }
+
+        fun isValidInlineEmojiSearchPreviousChar(
+            charBeforeBeforeCursor: Int,
+            settingsValues: SettingsValues
+        ): Boolean {
+            return !Character.isDigit(charBeforeBeforeCursor) && !settingsValues.isWordCodePoint(charBeforeBeforeCursor)
+        }
+    }
+}

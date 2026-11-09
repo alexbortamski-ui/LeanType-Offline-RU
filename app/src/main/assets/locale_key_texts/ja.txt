@@ -1,0 +1,14 @@
+[labels]
+comma: 、
+period: 。
+question: ？
+
+[popup_keys]
+punctuation !fixedOrder!10 、 。 ！ ？ ・ 「 」 （ ） 〜
+、 ,
+。 .
+？ ?
+！ !
+
+[tlds]
+jp

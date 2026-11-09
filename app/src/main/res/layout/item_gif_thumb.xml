@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/gifThumbContainer"
+    android:layout_width="wrap_content"
+    android:layout_height="@dimen/gif_thumb_height"
+    android:layout_marginHorizontal="3dp"
+    android:layout_marginVertical="2dp"
+    android:background="@drawable/bg_gif_thumb_card"
+    android:clipToOutline="true"
+    android:foreground="?android:attr/selectableItemBackground"
+    android:clickable="true"
+    android:focusable="true">
+
+    <ImageView
+        android:id="@+id/gifThumbImage"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="centerCrop"
+        android:contentDescription="@null" />
+
+    <TextView
+        android:id="@+id/liveBadge"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:layout_margin="4dp"
+        android:background="@drawable/bg_gif_search_box"
+        android:backgroundTint="#88000000"
+        android:text="LIVE"
+        android:textSize="8sp"
+        android:textStyle="bold"
+        android:textColor="#FFFFFF"
+        android:paddingHorizontal="4dp"
+        android:paddingVertical="1dp"
+        android:visibility="gone" />
+
+    <FrameLayout
+        android:id="@+id/insertOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#66000000"
+        android:visibility="gone">
+
+        <ProgressBar
+            android:id="@+id/insertProgress"
+            android:layout_width="24dp"
+            android:layout_height="24dp"
+            android:layout_gravity="center"
+            android:indeterminate="true" />
+    </FrameLayout>
+</FrameLayout>

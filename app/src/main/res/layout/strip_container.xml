@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Copyright (C) 2014 The Android Open Source Project
+    modified
+    SPDX-License-Identifier: Apache-2.0 AND GPL-3.0-only
+-->
+
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical">
+    <!-- To ensure that key preview popup is correctly placed when the current system locale is
+         one of RTL locales, layoutDirection="ltr" is needed in the SDK version 17+. -->
+    <helium314.keyboard.latin.suggestions.SuggestionStripView
+        android:id="@+id/suggestion_strip_view"
+        android:layoutDirection="ltr"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        style="?attr/suggestionStripViewStyle" />
+    <LinearLayout
+        android:id="@+id/emoji_tab_strip"
+        android:orientation="horizontal"
+        android:layout_width="match_parent"
+        android:layout_height="@dimen/config_suggestions_strip_height"
+        android:background="@android:color/transparent" />
+    <HorizontalScrollView
+        android:id="@+id/clipboard_strip_scroll_view"
+        android:layout_width="match_parent"
+        android:layout_height="@dimen/config_suggestions_strip_height"
+        android:fillViewport="true"
+        style="?attr/suggestionStripViewStyle"
+        android:scrollbarThumbHorizontal="@color/toolbar_scrollbar" >
+        <LinearLayout
+            android:id="@+id/clipboard_strip"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:gravity="end" >
+        </LinearLayout>
+    </HorizontalScrollView>
+    <LinearLayout
+        android:id="@+id/clipboard_edit_strip"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:visibility="gone"
+        style="?attr/suggestionStripViewStyle">
+        <helium314.keyboard.keyboard.InlineCursorTextView
+            android:id="@+id/clipboard_edit_text"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:gravity="center_vertical|start"
+            android:textSize="15sp"
+            android:paddingHorizontal="12dp"
+            android:paddingVertical="8dp" />
+        <ImageButton
+            android:id="@+id/clipboard_edit_save"
+            android:layout_width="@dimen/config_suggestions_strip_edge_key_width"
+            android:layout_height="@dimen/config_suggestions_strip_height"
+            android:src="@drawable/ic_setup_check"
+            android:background="@drawable/toolbar_key_background"
+            android:contentDescription="@string/save" />
+        <ImageButton
+            android:id="@+id/clipboard_edit_cancel"
+            android:layout_width="@dimen/config_suggestions_strip_edge_key_width"
+            android:layout_height="@dimen/config_suggestions_strip_height"
+            android:src="@drawable/ic_close"
+            android:background="@drawable/toolbar_key_background"
+            android:contentDescription="@android:string/cancel" />
+    </LinearLayout>
+    <HorizontalScrollView
+        android:id="@+id/ocr_strip_scroll_view"
+        android:layout_width="match_parent"
+        android:layout_height="@dimen/config_suggestions_strip_height"
+        android:fillViewport="true"
+        android:visibility="gone"
+        style="?attr/suggestionStripViewStyle"
+        android:scrollbarThumbHorizontal="@color/toolbar_scrollbar">
+        <LinearLayout
+            android:id="@+id/ocr_strip"
+            android:layout_width="wrap_content"
+            android:layout_height="match_parent"
+            android:orientation="horizontal"
+            android:gravity="start|center_vertical" />
+    </HorizontalScrollView>
+    <helium314.keyboard.latin.cjk.CjkCandidateStripView
+        android:id="@+id/cjk_candidate_strip_view"
+        android:layout_width="match_parent"
+        android:layout_height="@dimen/config_suggestions_strip_height"
+        android:visibility="gone"
+        style="?attr/suggestionStripViewStyle" />
+</LinearLayout>

@@ -1,0 +1,323 @@
+// SPDX-License-Identifier: GPL-3.0-only
+package helium314.keyboard.settings.preferences
+
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.widget.Toast
+import androidx.annotation.DrawableRes
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import helium314.keyboard.latin.R
+import helium314.keyboard.latin.handwriting.HandwritingLoader
+import helium314.keyboard.settings.FeedbackManager
+import helium314.keyboard.settings.dialogs.ConfirmationDialog
+import helium314.keyboard.settings.filePicker
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+
+@Composable
+fun LoadHandwritingPluginPreference(
+    title: String,
+    summary: String? = null,
+    @DrawableRes icon: Int? = null,
+    restartOnSuccess: Boolean = true,
+    onSuccess: (() -> Unit)? = null,
+) {
+    var showDialog by rememberSaveable { mutableStateOf(false) }
+    var isDownloading by rememberSaveable { mutableStateOf(false) }
+    var downloadProgress by remember { mutableFloatStateOf(0f) }
+    var remoteVersion by remember { mutableStateOf<String?>(null) }
+    var updateAvailable by remember { mutableStateOf(false) }
+    var isCheckingUpdate by remember { mutableStateOf(false) }
+
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    val hasInternet = remember {
+        ctx.packageManager.checkPermission(
+            "android.permission.INTERNET",
+            ctx.packageName
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+    }
+
+    val hasPlugin = HandwritingLoader.hasPlugin(ctx)
+    val localVersion = remember(hasPlugin) { HandwritingLoader.getPluginVersion(ctx) }
+
+    LaunchedEffect(hasPlugin) {
+        if (!hasInternet) return@LaunchedEffect
+        isCheckingUpdate = true
+        scope.launch(Dispatchers.IO) {
+            PluginUpdateHelper.fetchLatestReleaseTag("LeanBitLab/Leantype-Handwriting-Plugin")?.let { tag ->
+                remoteVersion = tag
+                if (hasPlugin && localVersion != null) {
+                    updateAvailable = PluginUpdateHelper.isUpdateAvailable(localVersion, tag)
+                }
+            }
+            isCheckingUpdate = false
+        }
+    }
+
+    val launcher = filePicker { uri ->
+        val success = HandwritingLoader.importPlugin(ctx, uri)
+        showDialog = false
+        if (success) {
+            FeedbackManager.message(ctx, R.string.handwriting_plugin_loaded_restarting)
+            onSuccess?.invoke()
+            if (restartOnSuccess) {
+                scope.launch {
+                    delay(2000)
+                    Runtime.getRuntime().exit(0)
+                }
+            }
+        } else {
+            FeedbackManager.message(ctx, R.string.load_handwriting_plugin_failed)
+        }
+    }
+
+    fun startDownload() {
+        if (!hasInternet) {
+            showDialog = false
+            val url = "https://github.com/LeanBitLab/Leantype-Handwriting-Plugin/releases"
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            try {
+                ctx.startActivity(intent)
+                Toast.makeText(ctx, ctx.getString(R.string.handwriting_plugin_open_browser_toast), Toast.LENGTH_LONG).show()
+            } catch (e: Exception) {
+                Toast.makeText(ctx, ctx.getString(R.string.open_browser_failed_format, e.localizedMessage ?: ""), Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+
+        isDownloading = true
+        downloadProgress = 0f
+        scope.launch(Dispatchers.IO) {
+            try {
+                val tag = remoteVersion ?: "latest"
+                val tempFile = File(ctx.cacheDir, "temp_handwriting_plugin.apk")
+                val downloaded = HandwritingLoader.downloadPluginApk(ctx, tag, tempFile) { prog ->
+                    scope.launch(Dispatchers.Main) {
+                        downloadProgress = prog
+                    }
+                }
+                if (!downloaded) {
+                    throw IOException("Failed to download handwriting plugin APK")
+                }
+
+                val success = HandwritingLoader.importPlugin(ctx, Uri.fromFile(tempFile))
+                tempFile.delete()
+
+                withContext(Dispatchers.Main) {
+                    isDownloading = false
+                    downloadProgress = 0f
+                    if (success) {
+                        FeedbackManager.message(ctx, R.string.handwriting_plugin_loaded_restarting)
+                        onSuccess?.invoke()
+                        showDialog = false
+                        if (restartOnSuccess) {
+                            scope.launch {
+                                delay(2000)
+                                Runtime.getRuntime().exit(0)
+                            }
+                        }
+                    } else {
+                        FeedbackManager.message(ctx, R.string.load_handwriting_plugin_failed)
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    isDownloading = false
+                    Toast.makeText(ctx, ctx.getString(R.string.plugin_download_failed_format, e.localizedMessage ?: ""), Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    Preference(
+        name = title,
+        description = summary,
+        icon = icon,
+        onClick = { showDialog = true }
+    )
+
+    if (showDialog) {
+        helium314.keyboard.settings.dialogs.PreferenceDialog(
+            onDismissRequest = { if (!isDownloading) showDialog = false },
+            title = stringResource(R.string.load_handwriting_plugin),
+            showCloseButton = !isDownloading,
+            buttons = {
+                if (isDownloading) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 16.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = if (downloadProgress > 0f) {
+                                    stringResource(R.string.downloading) + " ${(downloadProgress * 100).toInt()}%"
+                                } else {
+                                    stringResource(R.string.downloading)
+                                },
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                        if (downloadProgress > 0f) {
+                            LinearProgressIndicator(
+                                progress = { downloadProgress },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 8.dp)
+                            )
+                        } else {
+                            LinearProgressIndicator(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 8.dp)
+                            )
+                        }
+                    }
+                } else {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (!hasPlugin || updateAvailable) {
+                            Button(
+                                onClick = { startDownload() },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(if (updateAvailable) stringResource(R.string.updates_badge_update) else stringResource(R.string.button_download))
+                            }
+                        }
+                        if (!hasPlugin) {
+                            OutlinedButton(
+                                onClick = {
+                                    showDialog = false
+                                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                                        .addCategory(Intent.CATEGORY_OPENABLE)
+                                        .setType("*/*")
+                                    try {
+                                        launcher.launch(intent)
+                                    } catch (e: Exception) { }
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(stringResource(R.string.button_load_from_file))
+                            }
+                        }
+                        if (hasPlugin) {
+                            Button(
+                                onClick = {
+                                    HandwritingLoader.removePlugin(ctx)
+                                    FeedbackManager.message(ctx, R.string.handwriting_plugin_removed_restarting)
+                                    onSuccess?.invoke()
+                                    showDialog = false
+                                    if (restartOnSuccess) {
+                                        scope.launch {
+                                            delay(2000)
+                                            Runtime.getRuntime().exit(0)
+                                        }
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.error,
+                                    contentColor = MaterialTheme.colorScheme.onError
+                                ),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(stringResource(R.string.load_handwriting_plugin_button_delete))
+                            }
+                        }
+                    }
+                }
+            }
+        ) {
+            val message = when {
+                hasPlugin && updateAvailable -> stringResource(R.string.handwriting_plugin_update_available_dialog, localVersion.orEmpty(), remoteVersion ?: "")
+                hasPlugin -> stringResource(R.string.handwriting_plugin_active_warning, localVersion.orEmpty())
+                remoteVersion != null -> stringResource(R.string.handwriting_plugin_download_dialog_version_msg, remoteVersion ?: "")
+                else -> stringResource(R.string.handwriting_plugin_download_dialog_msg)
+            }
+            Text(message)
+        }
+    }
+}
+
+private fun buildLanguageEntries(context: Context): List<Pair<String, String>> {
+    val sysLocale = context.resources.configuration.locales[0]
+    val locales = java.util.Locale.getAvailableLocales()
+        .filter { !it.language.isNullOrEmpty() && it.toLanguageTag() != "und" }
+        .distinctBy { it.toLanguageTag() }
+        .sortedBy { it.getDisplayName(sysLocale).lowercase(sysLocale) }
+
+    val list = mutableListOf<Pair<String, String>>()
+    list.add(context.getString(R.string.handwriting_lang_follow_keyboard) to HandwritingLoader.LANG_FOLLOW_KEYBOARD)
+    for (loc in locales) {
+        val displayName = loc.getDisplayName(sysLocale)
+        val tag = loc.toLanguageTag()
+        list.add("$displayName ($tag)" to tag)
+    }
+    return list
+}
+
+@Composable
+fun HandwritingLanguagePreference() {
+    val ctx = LocalContext.current
+    val items = remember(ctx) { buildLanguageEntries(ctx) }
+    val setting = remember {
+        helium314.keyboard.settings.Setting(
+            key = HandwritingLoader.PREF_HANDWRITING_LANGUAGE,
+            title = ctx.getString(R.string.pref_handwriting_language_title)
+        ) {
+            ListPreference(
+                setting = it,
+                items = items,
+                default = HandwritingLoader.LANG_FOLLOW_KEYBOARD,
+                icon = R.drawable.ic_settings_languages
+            )
+        }
+    }
+    setting.Preference()
+}

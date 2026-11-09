@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+<merge xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Pre-edit buffer (displays segmented Pinyin or Romaji e.g. [ni'hao]) -->
+    <TextView
+        android:id="@+id/cjk_strip_preedit"
+        android:layout_width="wrap_content"
+        android:layout_height="match_parent"
+        android:gravity="center"
+        android:paddingStart="12dp"
+        android:paddingEnd="12dp"
+        android:textStyle="bold"
+        android:textSize="14sp"
+        android:singleLine="true"
+        android:visibility="gone" />
+
+    <View
+        android:id="@+id/cjk_strip_divider"
+        android:layout_width="1dp"
+        android:layout_height="22dp"
+        android:layout_gravity="center_vertical"
+        android:visibility="gone" />
+
+    <!-- Horizontally scrollable candidate list -->
+    <HorizontalScrollView
+        android:id="@+id/cjk_strip_scroll"
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1"
+        android:scrollbars="none"
+        android:fillViewport="true">
+
+        <LinearLayout
+            android:id="@+id/cjk_strip_candidates_container"
+            android:layout_width="wrap_content"
+            android:layout_height="match_parent"
+            android:orientation="horizontal"
+            android:gravity="center_vertical" />
+    </HorizontalScrollView>
+
+    <!-- Page scroll navigation buttons -->
+    <ImageButton
+        android:id="@+id/cjk_strip_prev_page"
+        android:layout_width="36dp"
+        android:layout_height="match_parent"
+        android:background="?android:attr/selectableItemBackgroundBorderless"
+        android:src="@drawable/ic_arrow_left"
+        android:contentDescription="@string/cjk_candidate_prev_page"
+        android:scaleType="centerInside"
+        android:visibility="gone" />
+
+    <ImageButton
+        android:id="@+id/cjk_strip_next_page"
+        android:layout_width="36dp"
+        android:layout_height="match_parent"
+        android:background="?android:attr/selectableItemBackgroundBorderless"
+        android:src="@drawable/ic_arrow_right"
+        android:contentDescription="@string/cjk_candidate_next_page"
+        android:scaleType="centerInside"
+        android:visibility="gone" />
+</merge>

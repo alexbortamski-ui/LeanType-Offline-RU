@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    SPDX-FileCopyrightText: Material Design Authors / Google LLC
+    SPDX-License-Identifier: Apache-2.0
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Capital 'A' matching Material Design typography -->
+    <path
+        android:fillColor="#FFF"
+        android:fillType="evenOdd"
+        android:pathData="M2.5,19h2.1l1.1,-3.5h4.6l1.1,3.5h2.1L9,5H7L2.5,19z M8,8.2l1.6,4.5H6.4L8,8.2z" />
+    <!-- Auto cycle arrow badge -->
+    <path
+        android:fillColor="#FFF"
+        android:pathData="M18,4.5c2.48,0 4.5,2.02 4.5,4.5c0,1.38 -0.63,2.61 -1.61,3.44l-1.28,-1.28c0.54,-0.57 0.89,-1.33 0.89,-2.16c0,-1.66 -1.34,-3 -3,-3c-0.83,0 -1.58,0.34 -2.14,0.89l1.64,1.61H13.5V4.5l1.68,1.68C16.03,5.13 17.19,4.5 18,4.5z" />
+</vector>

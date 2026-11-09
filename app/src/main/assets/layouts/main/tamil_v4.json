@@ -1,0 +1,44 @@
+[
+  [
+    { "$": "shift_state_selector", "default": { "label": "அ" }, "manualOrLocked": { "label": "ா" } },
+    { "$": "shift_state_selector", "default": { "label": "ஆ" }, "manualOrLocked": { "label": "ி" } },
+    { "$": "shift_state_selector", "default": { "label": "இ" }, "manualOrLocked": { "label": "ீ" } },
+    { "$": "shift_state_selector", "default": { "label": "க" }, "shiftedManual": { "label": "௧" } },
+    { "$": "shift_state_selector", "default": { "label": "ங" }, "shiftedManual": { "label": "௨" } },
+    { "$": "shift_state_selector", "default": { "label": "ச" }, "shiftedManual": { "label": "௩" } },
+    { "$": "shift_state_selector", "default": { "label": "ஞ" }, "shiftedManual": { "label": "௪" } },
+    { "$": "shift_state_selector", "default": { "label": "ட" }, "shiftedManual": { "label": "௫" } },
+    { "$": "shift_state_selector", "default": { "label": "ண" }, "shiftedManual": { "label": "௬" } }
+  ],
+  [
+    { "$": "shift_state_selector", "default": { "label": "ஈ" }, "manualOrLocked": { "label": "ு" } },
+    { "$": "shift_state_selector", "default": { "label": "உ" }, "manualOrLocked": { "label": "ூ" } },
+    { "$": "shift_state_selector", "default": { "label": "ஊ" }, "manualOrLocked": { "label": "ெ" } },
+    { "$": "shift_state_selector", "default": { "label": "த" }, "shiftedManual": { "label": "௭" } },
+    { "$": "shift_state_selector", "default": { "label": "ந" }, "shiftedManual": { "label": "௮" } },
+    { "$": "shift_state_selector", "default": { "label": "ப" }, "shiftedManual": { "label": "௯" } },
+    { "$": "shift_state_selector", "default": { "label": "ம" }, "shiftedManual": { "label": "௦" } },
+    { "$": "shift_state_selector", "default": { "label": "ய" }, "shiftedManual": { "label": "௰" } },
+    { "$": "shift_state_selector", "default": { "label": "ர" }, "shiftedManual": { "label": "௱" } }
+  ],
+  [
+    { "$": "shift_state_selector", "default": { "label": "எ" }, "manualOrLocked": { "label": "ே" } },
+    { "$": "shift_state_selector", "default": { "label": "ஏ" }, "manualOrLocked": { "label": "ை" } },
+    { "$": "shift_state_selector", "default": { "label": "ஐ" }, "manualOrLocked": { "label": "ொ" } },
+    { "$": "shift_state_selector", "default": { "label": "ல" }, "shiftedManual": { "label": "?" } },
+    { "$": "shift_state_selector", "default": { "label": "வ" }, "shiftedManual": { "label": "!" } },
+    { "$": "shift_state_selector", "default": { "label": "ழ" }, "shiftedManual": { "label": "\"" } },
+    { "$": "shift_state_selector", "default": { "label": "ள" }, "shiftedManual": { "label": "'" } },
+    { "$": "shift_state_selector", "default": { "label": "ற" }, "shiftedManual": { "label": ":" } },
+    { "$": "shift_state_selector", "default": { "label": "ன" }, "shiftedManual": { "label": "₹" } }
+  ],
+  [
+    { "label": "ஃ", "popup": { "main": { "label": "ௐ" } } },
+    { "label": "ஜ" },
+    { "$": "shift_state_selector", "default": { "label": "ஒ" }, "manualOrLocked": { "label": "ோ" } },
+    { "$": "shift_state_selector", "default": { "label": "ஓ" }, "manualOrLocked": { "label": "ௌ" } },
+    { "$": "shift_state_selector", "default": { "label": "்" }, "manualOrLocked": { "label": "ஔ" } },
+    { "label": "ஸ", "popup": { "main": { "label": "ஷ" } } },
+    { "label": "ஹ" }
+  ]
+]

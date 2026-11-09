@@ -1,0 +1,26 @@
+### 💖 Support Our Work
+
+As an open-source, community-funded project, we operate on a very limited budget and have little time for marketing. If LeanType helps you daily, please consider becoming a sponsor on [GitHub Sponsors](https://github.com/sponsors/LeanBitLab) or [Open Collective](https://opencollective.com/leantype). Even if you can't contribute financially, sharing LeanType with your friends, family, or on social media makes a world of difference to help our project grow. Thank you for your support!
+
+## 🚀 What's New in v4.1.6
+
+- **Ultra-Lightweight APKs (~9.8 MB)**: Unbundled dictionaries across all flavors in favor of on-demand downloads via DictManager, dramatically reducing baseline download size and storage footprint.
+- **Modular Offline AI Dynamic Plugin**: Decoupled the local GGUF AI engine into a standalone dynamic plugin (`LeanType-Offline-AI-Plugin`), keeping the core keyboard fast and lean.
+- **Instant Offline Translation Hot-Reload & Persistence**: Direct filesystem inspection and proactive plugin cache invalidation ensure imported translation models (`.zip`) are instantly recognized and retained across dialog reopenings without requiring a keyboard restart.
+- **Refined Setup Wizard & Unified Plugins Hub**: Streamlined the Welcome Wizard across all flavors and integrated Offline AI into the centralized Plugins Hub alongside Voice, Handwriting, and Translation.
+
+> ⚠️ **Important Notice for Offline & Offline Lite Users**:
+> - **Offline AI Plugin Detachment**: The local GGUF AI engine is now modularized into the standalone [**`LeanType-Offline-AI-Plugin`**](https://github.com/LeanBitLab/LeanType-Offline-AI-Plugin). Existing **Offline** flavor users are recommended to **backup their settings** (**Settings &rarr; Advanced &rarr; Backup**) before updating just in case. After updating, simply load the Offline AI Plugin from **Settings &rarr; Plugins &rarr; Offline AI** to continue using local GGUF model proofreading.
+> - **Offline Lite Users**: In the upcoming release, `offline` and `offlinelite` will merge into a single unified lightweight Offline edition with optional Offline AI plugin support.
+
+## 📦 Choose Your Flavor
+
+| Flavor                                          | Primary Focus                  | AI Engine        | Plugins Setup                  | Internet                         | Self-Updater         |
+|:----------------------------------------------- |:------------------------------ |:---------------- |:------------------------------ |:-------------------------------- |:-------------------- |
+| **`1-LeanType_4.1.6-standardfull-release.apk`** | **Convenience (Recommended)**  | Cloud AI         | In-app download or File import | Optional (AI/Updates/plugins)    | ✅ In-App Auto Update |
+| **`1-LeanType_4.1.6-standard-release.apk`**     | **F-Droid**                    | Cloud AI         | In-app download or File import | Optional (AI/plugins)            | ❌ None               |
+| **`2-LeanType_4.1.6-offline-release.apk`**      | **Offline**                    | Local LLM Plugin (8.0+) | Browser download + File import | 🚫 Zero Internet (No Permission) | ❌ None               |
+
+> 💡 **Plugin Compatibility**: All flavors support **Offline Handwriting Recognition**, **Offline Translation**, and **Offline Voice Dictation** via plugins, and work 100% offline.
+
+> 📢 **Unified Offline Edition**: `offline` and `offlinelite` have merged into a single unified **Offline** edition with `minSdk = 21` (Android 5.0+ compatible). Users on Android 8.0+ can optionally load the dynamic **Offline AI Plugin** from the Plugins Hub at any time.

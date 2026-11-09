@@ -1,0 +1,11 @@
+### 🐛 Fixed
+- **Clipboard History Lifecycle & Memory Trim Protection**: Prevented memory trim and memory deallocation handlers from dismantling the active clipboard history view while in use, safely cleaned up stale edit or selection modes upon entry, and guarded toolbar and search restorations against null clipboard strips.
+- **GIF Search Cursor Navigation & Arrow Keys**: Routed spacebar horizontal gesture swipe directly to the GIF search query cursor, and enabled hardware and directional D-pad arrow keys to navigate the cursor within the search field.
+- **GIF View Integration & Stability**: Automatically committed active composing host application text when opening the GIF picker to prevent text corruption or phantom spans, restored single-tap shift unshift behavior so the keyboard returns to lowercase after typing, unified horizontal and 2D vertical delete swipe gestures for search input, and resolved an Android 9 inflation crash caused by direct color reference in place of theme attributes.
+- **Input Logic Auto-Spacing & Backspace Undo**: Fixed standalone auto-spacing logic following suggestion selection to ensure consistent word separation, and resolved an off-by-one character offset in backspace undo to accurately restore previous text.
+- **2D Delete Swipe Deselection**: Supported horizontal-right swipe to immediately deselect highlighted text following a vertical-only selection gesture without requiring a prior leftward swipe.
+- **Toolbar Recovery & Popups in Split Layout**: Restored suggestion strip cleanly after exiting touchpad mode, resolved split toolbar editing and touch interaction state in split keyboard layouts, and prevented stuck key previews and popups during rapid gestures and mode switches.
+- **Theme Color Defaults & Toolbar Settings**: Sourced active theme default color values when customizing colors in "Show All Colors" mode, and preserved child toolbar settings and arrangements across theme reloads.
+
+### 🔄 Changed
+- **Language Detector Unit Test Suite**: Added comprehensive test suite for `LanguageDetector` covering script-based detection across multiple Unicode scripts (Arabic, CJK, Cyrillic, etc.), heuristic word and diacritic detection (Spanish, French, German, etc.), and target language avoidance behavior for fallback mapping.
